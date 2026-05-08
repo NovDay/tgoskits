@@ -323,26 +323,31 @@ impl Pollable for EventDev {
 
 pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
     let mut inputs = DirMapping::new();
-    let mut input_id = 0;
     let input_devices = ax_input::take_inputs();
-    let mut keys = [0; 0x300usize.div_ceil(8)];
-    for (i, mut device) in input_devices.into_iter().enumerate() {
-        assert!(device.get_event_bits(EventType::Key, &mut keys).unwrap());
+    let mut has_mice = false;
+    for (input_id, mut device) in input_devices.into_iter().enumerate() {
+        let mut keys = [0; 0x300usize.div_ceil(8)];
+        let has_keys = match device.get_event_bits(EventType::Key, &mut keys) {
+            Ok(has_keys) => has_keys,
+            Err(err) => {
+                warn!("Failed to query input key bits: {err:?}");
+                false
+            }
+        };
+        const BTN_MOUSE: usize = 0x110;
+        let is_mouse = has_keys && keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0;
 
         let dev = Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(13, (i + 1) as _),
+            DeviceId::new(13, (input_id + 1) as _),
             Arc::new(EventDev::new(device)),
         );
 
-        const BTN_MOUSE: usize = 0x110;
-        if keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0 {
-            // Mouse
+        inputs.add(format!("event{input_id}"), dev.clone());
+        if is_mouse && !has_mice {
             inputs.add("mice", dev);
-        } else {
-            inputs.add(format!("event{input_id}"), dev);
-            input_id += 1;
+            has_mice = true;
         }
     }
     inputs
