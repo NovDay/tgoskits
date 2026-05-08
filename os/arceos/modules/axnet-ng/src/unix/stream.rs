@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
@@ -15,7 +15,7 @@ use ringbuf::{
 };
 
 use crate::{
-    RecvOptions, SendOptions, Shutdown,
+    CMsgData, RecvOptions, SendOptions, Shutdown,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     unix::{Transport, TransportOps, UnixSocketAddr},
@@ -31,16 +31,22 @@ fn new_channels(pid: u32) -> (Channel, Channel) {
     let (client_tx, server_rx) = new_uni_channel();
     let (server_tx, client_rx) = new_uni_channel();
     let poll_update = Arc::new(PollSet::new());
+    let client_to_server_meta = Arc::new(Mutex::new(StreamMeta::default()));
+    let server_to_client_meta = Arc::new(Mutex::new(StreamMeta::default()));
     (
         Channel {
             tx: client_tx,
             rx: client_rx,
+            tx_meta: client_to_server_meta.clone(),
+            rx_meta: server_to_client_meta.clone(),
             poll_update: poll_update.clone(),
             peer_pid: pid,
         },
         Channel {
             tx: server_tx,
             rx: server_rx,
+            tx_meta: server_to_client_meta,
+            rx_meta: client_to_server_meta,
             poll_update,
             peer_pid: pid,
         },
@@ -50,9 +56,58 @@ fn new_channels(pid: u32) -> (Channel, Channel) {
 struct Channel {
     tx: HeapProd<u8>,
     rx: HeapCons<u8>,
+    tx_meta: Arc<Mutex<StreamMeta>>,
+    rx_meta: Arc<Mutex<StreamMeta>>,
     // TODO: granularity
     poll_update: Arc<PollSet>,
     peer_pid: u32,
+}
+
+#[derive(Default)]
+struct StreamMeta {
+    write_seq: usize,
+    read_seq: usize,
+    ancillary: VecDeque<AncillaryRecord>,
+}
+
+struct AncillaryRecord {
+    end_seq: usize,
+    cmsg: Vec<CMsgData>,
+}
+
+impl StreamMeta {
+    fn note_write(&mut self, count: usize, cmsg: Option<Vec<CMsgData>>) {
+        self.write_seq = self.write_seq.saturating_add(count);
+        if let Some(cmsg) = cmsg
+            && !cmsg.is_empty()
+        {
+            self.ancillary.push_back(AncillaryRecord {
+                end_seq: self.write_seq,
+                cmsg,
+            });
+        }
+    }
+
+    fn bytes_until_ancillary(&self) -> Option<usize> {
+        self.ancillary
+            .front()
+            .map(|record| record.end_seq.saturating_sub(self.read_seq))
+    }
+
+    fn note_read(&mut self, count: usize, mut cmsg_dst: Option<&mut Vec<CMsgData>>) {
+        self.read_seq = self.read_seq.saturating_add(count);
+        let read_seq = self.read_seq;
+        while self
+            .ancillary
+            .front()
+            .is_some_and(|record| record.end_seq <= read_seq)
+        {
+            let record = self.ancillary.pop_front().expect("record checked above");
+            if let Some(dst) = cmsg_dst.as_deref_mut() {
+                dst.extend(record.cmsg);
+            }
+        }
+    }
 }
 
 pub struct Bind {
@@ -221,6 +276,7 @@ impl TransportOps for StreamTransport {
         }
         let size = src.remaining();
         let mut total = 0;
+        let mut cmsg = Some(options.cmsg);
         let non_blocking = self.general.nonblocking();
         self.general.send_poller(self, || {
             let mut guard = self.channel.lock();
@@ -242,6 +298,7 @@ impl TransportOps for StreamTransport {
             };
             total += count;
             if count > 0 {
+                chan.tx_meta.lock().note_write(count, cmsg.take());
                 chan.poll_update.wake();
             }
 
@@ -253,7 +310,7 @@ impl TransportOps for StreamTransport {
         })
     }
 
-    fn recv(&self, mut dst: impl Write, _options: RecvOptions) -> AxResult<usize> {
+    fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
         self.general.recv_poller(self, || {
             let mut guard = self.channel.lock();
             let Some(chan) = guard.as_mut() else {
@@ -261,15 +318,22 @@ impl TransportOps for StreamTransport {
             };
 
             let count = {
+                let ancillary_limit = chan.rx_meta.lock().bytes_until_ancillary();
                 let (left, right) = chan.rx.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
+                let limit = ancillary_limit.unwrap_or(usize::MAX);
+                let left_len = left.len().min(limit);
+                let mut count = dst.write(&left[..left_len])?;
+                if count >= left_len && count < limit {
+                    let remaining = limit - count;
+                    count += dst.write(&right[..right.len().min(remaining)])?;
                 }
                 unsafe { chan.rx.advance_read_index(count) };
                 count
             };
             if count > 0 {
+                chan.rx_meta
+                    .lock()
+                    .note_read(count, options.cmsg.as_deref_mut());
                 chan.poll_update.wake();
                 Ok(count)
             } else if !chan.rx.write_is_held() {

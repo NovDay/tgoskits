@@ -12,7 +12,7 @@ use ax_sync::Mutex;
 use ax_task::future::{block_on, poll_io};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_NONBLOCK};
 
 use super::{FileLike, Kstat, get_file_like};
 use crate::file::{IoDst, IoSrc};
@@ -107,8 +107,8 @@ impl File {
     pub fn new(inner: ax_fs::File, open_flags: u32) -> Self {
         Self {
             inner,
-            open_flags,
-            nonblock: AtomicBool::new(false),
+            open_flags: open_flags & !O_NONBLOCK,
+            nonblock: AtomicBool::new(open_flags & O_NONBLOCK != 0),
         }
     }
 
@@ -140,13 +140,17 @@ impl FileLike for File {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let inner = self.inner();
-        if likely(self.is_blocking()) {
+        let written = if likely(self.is_blocking()) {
             inner.write(src)
         } else {
             block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
                 inner.write(&mut *src)
             }))
+        }?;
+        if written > 0 {
+            super::inotify::notify_file_modified(&self.path());
         }
+        Ok(written)
     }
 
     fn stat(&self) -> AxResult<Kstat> {

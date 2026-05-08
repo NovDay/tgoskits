@@ -15,7 +15,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 use crate::{
-    file::{Directory, File, FileLike, Pipe, get_file_like},
+    file::{Directory, File, FileLike, Pipe, get_file_like, inotify},
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytes, VmBytesMut},
 };
 
@@ -152,6 +152,9 @@ pub fn sys_truncate(path: UserConstPtr<c_char>, length: __kernel_off_t) -> AxRes
         .open(&FS_CONTEXT.lock(), path)?
         .into_file()?;
     file.access(FileFlags::WRITE)?.set_len(length as _)?;
+    if let Ok(path) = file.location().absolute_path() {
+        inotify::notify_file_modified(path.as_ref());
+    }
     Ok(0)
 }
 
@@ -162,6 +165,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
     }
     let f = File::from_fd(fd)?;
     f.inner().access(FileFlags::WRITE)?.set_len(length as _)?;
+    inotify::notify_file_modified(&f.path());
     Ok(0)
 }
 
@@ -189,6 +193,7 @@ pub fn sys_fallocate(
     let inner = f.inner();
     let file = inner.access(FileFlags::WRITE)?;
     file.set_len(file.location().len()?.max(end))?;
+    inotify::notify_file_modified(&f.path());
     Ok(0)
 }
 
@@ -271,6 +276,9 @@ pub fn sys_pwrite64(
         return Ok(0);
     }
     let write = f.inner().write_at(VmBytes::new(buf, len), offset as _)?;
+    if write > 0 {
+        inotify::notify_file_modified(&f.path());
+    }
     Ok(write as _)
 }
 
@@ -351,7 +359,11 @@ pub fn sys_pwritev2(
         f.write(&mut io_buf).map(|n| n as _)
     } else {
         let f = file_or_espipe(fd)?;
-        f.inner().write_at(io_buf, offset as _).map(|n| n as _)
+        let write = f.inner().write_at(io_buf, offset as _)?;
+        if write > 0 {
+            inotify::notify_file_modified(&f.path());
+        }
+        Ok(write as _)
     }
 }
 

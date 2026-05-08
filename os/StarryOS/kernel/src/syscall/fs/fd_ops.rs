@@ -8,19 +8,28 @@ use core::{
 use ax_errno::{AxError, AxResult};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
 use ax_task::current;
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference};
+use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference, path::Path};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 
 use crate::{
     file::{
         Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
-        with_fs,
+        inotify, with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
     task::AsThread,
 };
+
+fn parent_watch_target(
+    dirfd: c_int,
+    path: &str,
+) -> Option<(alloc::string::String, alloc::string::String)> {
+    let (dir, name) = with_fs(dirfd, |fs| fs.resolve_parent(Path::new(path))).ok()?;
+    let parent = dir.absolute_path().ok()?.to_string();
+    Some((parent, name.to_string()))
+}
 
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32)) -> OpenOptions {
@@ -126,9 +135,20 @@ pub fn sys_openat(
 
     let cred = current().as_thread().cred();
     let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
-    with_fs(dirfd, |fs| options.open(fs, path))
-        .and_then(|it| add_to_fd(it, flags as _))
-        .map(|fd| fd as isize)
+    let raw_flags = flags as u32;
+    let create_target = if raw_flags & O_CREAT != 0 {
+        with_fs(dirfd, |fs| fs.resolve_no_follow(&path))
+            .is_err()
+            .then(|| parent_watch_target(dirfd, &path))
+            .flatten()
+    } else {
+        None
+    };
+    let fd = with_fs(dirfd, |fs| options.open(fs, path)).and_then(|it| add_to_fd(it, raw_flags))?;
+    if let Some((parent, name)) = create_target {
+        inotify::notify_child_event(&parent, &name, IN_CREATE, 0);
+    }
+    Ok(fd as isize)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.
