@@ -11,8 +11,8 @@ use axnet::{
 use linux_raw_sys::{
     general::timespec,
     net::{
-        MSG_PEEK, MSG_TRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr,
-        sockaddr, socklen_t,
+        MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, MSG_TRUNC, SCM_CREDENTIALS,
+        SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
 
@@ -78,15 +78,24 @@ fn send_impl(
         Some(SocketAddrEx::read_from_user(addr, addrlen)?)
     };
 
+    let unsupported = flags & !(MSG_DONTWAIT | MSG_NOSIGNAL);
+    if unsupported != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
 
     let socket = Socket::from_fd(fd)?;
     socket.update_current_credentials();
+    let mut send_flags = SendFlags::empty();
+    if flags & MSG_DONTWAIT != 0 {
+        send_flags |= SendFlags::DONTWAIT;
+    }
     let sent = socket.send(
         &mut src,
         SendOptions {
             to: addr,
-            flags: SendFlags::default(),
+            flags: send_flags,
             cmsg,
         },
     )?;
@@ -128,6 +137,11 @@ fn recv_impl(
 ) -> AxResult<isize> {
     debug!("sys_recv <= fd: {fd}, flags: {flags}");
 
+    let unsupported = flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+    if unsupported != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     let socket = Socket::from_fd(fd)?;
     let mut recv_flags = RecvFlags::empty();
     if flags & MSG_PEEK != 0 {
@@ -135,6 +149,9 @@ fn recv_impl(
     }
     if flags & MSG_TRUNC != 0 {
         recv_flags |= RecvFlags::TRUNCATE;
+    }
+    if flags & MSG_DONTWAIT != 0 {
+        recv_flags |= RecvFlags::DONTWAIT;
     }
 
     let mut cmsg = Vec::new();
@@ -163,7 +180,7 @@ fn recv_impl(
                         for (f, chunk) in
                             fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>()))
                         {
-                            let fd = add_file_like(f, false)?;
+                            let fd = add_file_like(f, flags & MSG_CMSG_CLOEXEC != 0)?;
                             chunk.copy_from_slice(&fd.to_ne_bytes());
                             written += size_of::<i32>();
                         }

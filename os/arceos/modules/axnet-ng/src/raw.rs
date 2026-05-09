@@ -24,7 +24,7 @@ use smoltcp::{
 use spin::RwLock;
 
 use crate::{
-    RecvFlags, RecvOptions, SOCKET_SET, SendOptions, Shutdown, SocketAddrEx, SocketOps,
+    RecvFlags, RecvOptions, SOCKET_SET, SendFlags, SendOptions, Shutdown, SocketAddrEx, SocketOps,
     consts::{RAW_RX_BUF_LEN, RAW_TX_BUF_LEN},
     general::GeneralOptions,
     get_service,
@@ -204,52 +204,18 @@ impl SocketOps for RawSocket {
         let local = self.local_address_for(remote);
         let payload_len = src.remaining();
 
-        self.general.send_poller(self, || {
-            poll_interfaces();
-            self.with_smol_socket(|socket| {
-                if !socket.can_send() {
-                    return Err(AxError::WouldBlock);
-                }
-                let next_header = socket.ip_protocol().expect("raw socket protocol");
-                let hop_limit = (*self.ttl.read()).unwrap_or(64);
-
-                let header_len = match self.ip_version {
-                    IpVersion::Ipv4 => Ipv4Repr {
-                        src_addr: match local {
-                            IpAddress::Ipv4(addr) => addr,
-                            _ => unreachable!(),
-                        },
-                        dst_addr: match remote {
-                            IpAddress::Ipv4(addr) => addr,
-                            _ => unreachable!(),
-                        },
-                        next_header,
-                        payload_len,
-                        hop_limit,
+        self.general
+            .send_poller(self, options.flags.contains(SendFlags::DONTWAIT), || {
+                poll_interfaces();
+                self.with_smol_socket(|socket| {
+                    if !socket.can_send() {
+                        return Err(AxError::WouldBlock);
                     }
-                    .buffer_len(),
-                    IpVersion::Ipv6 => Ipv6Repr {
-                        src_addr: match local {
-                            IpAddress::Ipv6(addr) => addr,
-                            _ => unreachable!(),
-                        },
-                        dst_addr: match remote {
-                            IpAddress::Ipv6(addr) => addr,
-                            _ => unreachable!(),
-                        },
-                        next_header,
-                        payload_len,
-                        hop_limit,
-                    }
-                    .buffer_len(),
-                };
+                    let next_header = socket.ip_protocol().expect("raw socket protocol");
+                    let hop_limit = (*self.ttl.read()).unwrap_or(64);
 
-                let buf = socket
-                    .send(header_len + payload_len)
-                    .map_err(|_| AxError::WouldBlock)?;
-                match self.ip_version {
-                    IpVersion::Ipv4 => {
-                        let header = Ipv4Repr {
+                    let header_len = match self.ip_version {
+                        IpVersion::Ipv4 => Ipv4Repr {
                             src_addr: match local {
                                 IpAddress::Ipv4(addr) => addr,
                                 _ => unreachable!(),
@@ -261,14 +227,9 @@ impl SocketOps for RawSocket {
                             next_header,
                             payload_len,
                             hop_limit,
-                        };
-                        header.emit(
-                            &mut Ipv4Packet::new_unchecked(&mut *buf),
-                            &smoltcp::phy::ChecksumCapabilities::ignored(),
-                        );
-                    }
-                    IpVersion::Ipv6 => {
-                        let header = Ipv6Repr {
+                        }
+                        .buffer_len(),
+                        IpVersion::Ipv6 => Ipv6Repr {
                             src_addr: match local {
                                 IpAddress::Ipv6(addr) => addr,
                                 _ => unreachable!(),
@@ -280,23 +241,64 @@ impl SocketOps for RawSocket {
                             next_header,
                             payload_len,
                             hop_limit,
-                        };
-                        header.emit(&mut Ipv6Packet::new_unchecked(&mut *buf));
-                    }
-                }
-
-                let written = src.read(&mut buf[header_len..])?;
-                if next_header == IpProtocol::Icmpv6 {
-                    let (IpAddress::Ipv6(src_addr), IpAddress::Ipv6(dst_addr)) = (local, remote)
-                    else {
-                        unreachable!();
+                        }
+                        .buffer_len(),
                     };
-                    Icmpv6Packet::new_unchecked(&mut buf[header_len..])
-                        .fill_checksum(&src_addr, &dst_addr);
-                }
-                Ok(written)
+
+                    let buf = socket
+                        .send(header_len + payload_len)
+                        .map_err(|_| AxError::WouldBlock)?;
+                    match self.ip_version {
+                        IpVersion::Ipv4 => {
+                            let header = Ipv4Repr {
+                                src_addr: match local {
+                                    IpAddress::Ipv4(addr) => addr,
+                                    _ => unreachable!(),
+                                },
+                                dst_addr: match remote {
+                                    IpAddress::Ipv4(addr) => addr,
+                                    _ => unreachable!(),
+                                },
+                                next_header,
+                                payload_len,
+                                hop_limit,
+                            };
+                            header.emit(
+                                &mut Ipv4Packet::new_unchecked(&mut *buf),
+                                &smoltcp::phy::ChecksumCapabilities::ignored(),
+                            );
+                        }
+                        IpVersion::Ipv6 => {
+                            let header = Ipv6Repr {
+                                src_addr: match local {
+                                    IpAddress::Ipv6(addr) => addr,
+                                    _ => unreachable!(),
+                                },
+                                dst_addr: match remote {
+                                    IpAddress::Ipv6(addr) => addr,
+                                    _ => unreachable!(),
+                                },
+                                next_header,
+                                payload_len,
+                                hop_limit,
+                            };
+                            header.emit(&mut Ipv6Packet::new_unchecked(&mut *buf));
+                        }
+                    }
+
+                    let written = src.read(&mut buf[header_len..])?;
+                    if next_header == IpProtocol::Icmpv6 {
+                        let (IpAddress::Ipv6(src_addr), IpAddress::Ipv6(dst_addr)) =
+                            (local, remote)
+                        else {
+                            unreachable!();
+                        };
+                        Icmpv6Packet::new_unchecked(&mut buf[header_len..])
+                            .fill_checksum(&src_addr, &dst_addr);
+                    }
+                    Ok(written)
+                })
             })
-        })
     }
 
     fn recv(&self, mut dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
@@ -305,43 +307,44 @@ impl SocketOps for RawSocket {
         }
         let mut options = options;
 
-        self.general.recv_poller(self, || {
-            poll_interfaces();
-            self.with_smol_socket(|socket| {
-                loop {
-                    let packet = if options.flags.contains(RecvFlags::PEEK) {
-                        let packet = socket.peek().map_err(|_| AxError::WouldBlock)?;
-                        let (source, _) = self.parse_ip_packet(packet)?;
+        self.general
+            .recv_poller(self, options.flags.contains(RecvFlags::DONTWAIT), || {
+                poll_interfaces();
+                self.with_smol_socket(|socket| {
+                    loop {
+                        let packet = if options.flags.contains(RecvFlags::PEEK) {
+                            let packet = socket.peek().map_err(|_| AxError::WouldBlock)?;
+                            let (source, _) = self.parse_ip_packet(packet)?;
+                            if let Some(peer) = *self.peer_addr.read()
+                                && source != peer
+                            {
+                                return Err(AxError::WouldBlock);
+                            }
+                            packet
+                        } else {
+                            socket.recv().map_err(|_| AxError::WouldBlock)?
+                        };
+                        let (source, packet) = self.parse_ip_packet(packet)?;
+
                         if let Some(peer) = *self.peer_addr.read()
                             && source != peer
                         {
-                            return Err(AxError::WouldBlock);
+                            continue;
                         }
-                        packet
-                    } else {
-                        socket.recv().map_err(|_| AxError::WouldBlock)?
-                    };
-                    let (source, packet) = self.parse_ip_packet(packet)?;
 
-                    if let Some(peer) = *self.peer_addr.read()
-                        && source != peer
-                    {
-                        continue;
+                        if let Some(from) = options.from.as_deref_mut() {
+                            *from = SocketAddrEx::Ip(SocketAddr::new(source.into(), 0));
+                        }
+
+                        let written = dst.write(packet)?;
+                        return Ok(if options.flags.contains(RecvFlags::TRUNCATE) {
+                            packet.len()
+                        } else {
+                            written
+                        });
                     }
-
-                    if let Some(from) = options.from.as_deref_mut() {
-                        *from = SocketAddrEx::Ip(SocketAddr::new(source.into(), 0));
-                    }
-
-                    let written = dst.write(packet)?;
-                    return Ok(if options.flags.contains(RecvFlags::TRUNCATE) {
-                        packet.len()
-                    } else {
-                        written
-                    });
-                }
+                })
             })
-        })
     }
 
     fn local_addr(&self) -> AxResult<SocketAddrEx> {

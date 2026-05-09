@@ -107,7 +107,7 @@ impl VsockTransportOps for VsockStreamTransport {
         let local_port = conn.lock().local_addr().port;
 
         // wait for connection
-        self.general.recv_poller(self, || {
+        self.general.recv_poller(self, false, || {
             let mut manager = VSOCK_CONN_MANAGER.lock();
 
             if !manager.can_accept(local_port) {
@@ -189,7 +189,7 @@ impl VsockTransportOps for VsockStreamTransport {
         })?;
 
         // wait for connection established
-        self.general.send_poller(self, || {
+        self.general.send_poller(self, false, || {
             let conn = self.get_connection()?;
             let state = conn.lock().state();
             match state {
@@ -224,47 +224,48 @@ impl VsockTransportOps for VsockStreamTransport {
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
         let conn = self.get_connection()?;
 
-        self.general.recv_poller(self, || {
-            let mut conn_guard = conn.lock();
+        self.general
+            .recv_poller(self, options.flags.contains(RecvFlags::DONTWAIT), || {
+                let mut conn_guard = conn.lock();
 
-            if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {
-                return Ok(0); // EOF
-            }
+                if conn_guard.rx_closed() && conn_guard.rx_buffer_used() == 0 {
+                    return Ok(0); // EOF
+                }
 
-            // should allow read when connection is closed, to read remaining data
-            if !matches!(
-                conn_guard.state(),
-                ConnectionState::Connected | ConnectionState::Closed
-            ) {
-                return Err(AxError::NotConnected);
-            }
+                // should allow read when connection is closed, to read remaining data
+                if !matches!(
+                    conn_guard.state(),
+                    ConnectionState::Connected | ConnectionState::Closed
+                ) {
+                    return Err(AxError::NotConnected);
+                }
 
-            if conn_guard.rx_buffer_used() == 0 {
-                return Err(AxError::WouldBlock);
-            }
+                if conn_guard.rx_buffer_used() == 0 {
+                    return Err(AxError::WouldBlock);
+                }
 
-            let (left, right) = conn_guard.rx_slices();
-            let mut count = dst.write(left)?;
+                let (left, right) = conn_guard.rx_slices();
+                let mut count = dst.write(left)?;
 
-            if count >= left.len() && !right.is_empty() {
-                count += dst.write(right)?;
-            }
-            if !options.flags.contains(RecvFlags::PEEK) {
-                conn_guard.advance_rx_read(count);
-            }
+                if count >= left.len() && !right.is_empty() {
+                    count += dst.write(right)?;
+                }
+                if !options.flags.contains(RecvFlags::PEEK) {
+                    conn_guard.advance_rx_read(count);
+                }
 
-            if count > 0 {
-                trace!(
-                    "Recv {} bytes from connection (buffer_remaining={}/{})",
-                    count,
-                    conn_guard.rx_buffer_used(),
-                    VSOCK_RX_BUFFER_SIZE
-                );
-                Ok(count)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+                if count > 0 {
+                    trace!(
+                        "Recv {} bytes from connection (buffer_remaining={}/{})",
+                        count,
+                        conn_guard.rx_buffer_used(),
+                        VSOCK_RX_BUFFER_SIZE
+                    );
+                    Ok(count)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {

@@ -15,7 +15,7 @@ use ringbuf::{
 };
 
 use crate::{
-    CMsgData, RecvOptions, SendOptions, Shutdown,
+    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     unix::{Transport, TransportOps, UnixSocketAddr},
@@ -332,7 +332,14 @@ impl TransportOps for StreamTransport {
             channel,
             addr: peer_addr,
             pid,
-        } = rx.recv().await.map_err(|_| AxError::ConnectionReset)?;
+        } = if self.general.nonblocking() {
+            rx.try_recv().map_err(|err| match err {
+                async_channel::TryRecvError::Empty => AxError::WouldBlock,
+                async_channel::TryRecvError::Closed => AxError::ConnectionReset,
+            })?
+        } else {
+            rx.recv().await.map_err(|_| AxError::ConnectionReset)?
+        };
         Ok((
             Transport::Stream(StreamTransport::new_channel(Some(channel), pid)),
             peer_addr,
@@ -346,95 +353,98 @@ impl TransportOps for StreamTransport {
         let size = src.remaining();
         let mut total = 0;
         let mut cmsg = Some(options.cmsg);
-        let non_blocking = self.general.nonblocking();
-        self.general.send_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
-            if !chan.tx.read_is_held() {
-                return Err(AxError::BrokenPipe);
-            }
-
-            let count = {
-                let (left, right) = chan.tx.vacant_slices_mut();
-                let mut count = src.read(unsafe { left.assume_init_mut() })?;
-                if count >= left.len() {
-                    count += src.read(unsafe { right.assume_init_mut() })?;
+        let non_blocking =
+            self.general.nonblocking() || options.flags.contains(SendFlags::DONTWAIT);
+        self.general
+            .send_poller(self, options.flags.contains(SendFlags::DONTWAIT), || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
+                if !chan.tx.read_is_held() {
+                    return Err(AxError::BrokenPipe);
                 }
-                unsafe { chan.tx.advance_write_index(count) };
-                count
-            };
-            total += count;
-            if count > 0 {
-                chan.tx_meta.lock().note_write(
-                    count,
-                    cmsg.take(),
-                    self.current_credentials.lock().clone(),
-                );
-                chan.poll_update.wake();
-            }
 
-            if count == size || non_blocking {
-                Ok(total)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+                let count = {
+                    let (left, right) = chan.tx.vacant_slices_mut();
+                    let mut count = src.read(unsafe { left.assume_init_mut() })?;
+                    if count >= left.len() {
+                        count += src.read(unsafe { right.assume_init_mut() })?;
+                    }
+                    unsafe { chan.tx.advance_write_index(count) };
+                    count
+                };
+                total += count;
+                if count > 0 {
+                    chan.tx_meta.lock().note_write(
+                        count,
+                        cmsg.take(),
+                        self.current_credentials.lock().clone(),
+                    );
+                    chan.poll_update.wake();
+                }
+
+                if count == size || (non_blocking && total > 0) {
+                    Ok(total)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
-        self.general.recv_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
+        self.general
+            .recv_poller(self, options.flags.contains(RecvFlags::DONTWAIT), || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
 
-            let count = {
-                let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
-                let read_limit = {
-                    let mut meta = chan.rx_meta.lock();
-                    let ancillary_limit = meta.bytes_until_ancillary();
-                    let credential_limit = pass_credentials
-                        .then(|| meta.bytes_until_credentials())
-                        .flatten();
-                    ancillary_limit.into_iter().chain(credential_limit).min()
+                let count = {
+                    let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                    let read_limit = {
+                        let mut meta = chan.rx_meta.lock();
+                        let ancillary_limit = meta.bytes_until_ancillary();
+                        let credential_limit = pass_credentials
+                            .then(|| meta.bytes_until_credentials())
+                            .flatten();
+                        ancillary_limit.into_iter().chain(credential_limit).min()
+                    };
+                    let (left, right) = chan.rx.as_slices();
+                    let limit = read_limit.unwrap_or(usize::MAX);
+                    let left_len = left.len().min(limit);
+                    let mut count = dst.write(&left[..left_len])?;
+                    if count >= left_len && count < limit {
+                        let remaining = limit - count;
+                        count += dst.write(&right[..right.len().min(remaining)])?;
+                    }
+                    unsafe { chan.rx.advance_read_index(count) };
+                    count
                 };
-                let (left, right) = chan.rx.as_slices();
-                let limit = read_limit.unwrap_or(usize::MAX);
-                let left_len = left.len().min(limit);
-                let mut count = dst.write(&left[..left_len])?;
-                if count >= left_len && count < limit {
-                    let remaining = limit - count;
-                    count += dst.write(&right[..right.len().min(remaining)])?;
+                if count > 0 {
+                    let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                    let received_credentials = {
+                        let mut meta = chan.rx_meta.lock();
+                        let credentials = meta.note_read(count, options.cmsg.as_deref_mut());
+                        pass_credentials.then_some(credentials).flatten()
+                    };
+                    if pass_credentials
+                        && let Some(cmsg) = options.cmsg.as_deref_mut()
+                        && let Some(credentials) = received_credentials
+                    {
+                        cmsg.push(Box::new(credentials));
+                    }
+                    chan.poll_update.wake();
+                    Ok(count)
+                } else if !chan.rx.write_is_held() {
+                    // Peer dropped its sender end and the ring is empty: EOF.
+                    // Returning WouldBlock here would park the caller forever
+                    // waiting for data that will never arrive.
+                    Ok(0)
+                } else {
+                    Err(AxError::WouldBlock)
                 }
-                unsafe { chan.rx.advance_read_index(count) };
-                count
-            };
-            if count > 0 {
-                let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
-                let received_credentials = {
-                    let mut meta = chan.rx_meta.lock();
-                    let credentials = meta.note_read(count, options.cmsg.as_deref_mut());
-                    pass_credentials.then_some(credentials).flatten()
-                };
-                if pass_credentials
-                    && let Some(cmsg) = options.cmsg.as_deref_mut()
-                    && let Some(credentials) = received_credentials
-                {
-                    cmsg.push(Box::new(credentials));
-                }
-                chan.poll_update.wake();
-                Ok(count)
-            } else if !chan.rx.write_is_held() {
-                // Peer dropped its sender end and the ring is empty: EOF.
-                // Returning WouldBlock here would park the caller forever
-                // waiting for data that will never arrive.
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+            })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {

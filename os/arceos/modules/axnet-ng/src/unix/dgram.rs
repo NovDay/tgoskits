@@ -239,47 +239,51 @@ impl TransportOps for DgramTransport {
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
-        self.general.recv_poller(self, move || {
-            let mut guard = self.data_rx.lock();
-            let Some((rx, _)) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
+        self.general.recv_poller(
+            self,
+            options.flags.contains(RecvFlags::DONTWAIT),
+            move || {
+                let mut guard = self.data_rx.lock();
+                let Some((rx, _)) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
 
-            let Packet {
-                data,
-                cmsg,
-                sender,
-                sender_credentials,
-            } = match rx.try_recv() {
-                Ok(packet) => packet,
-                Err(TryRecvError::Empty) => {
-                    return Err(AxError::WouldBlock);
+                let Packet {
+                    data,
+                    cmsg,
+                    sender,
+                    sender_credentials,
+                } = match rx.try_recv() {
+                    Ok(packet) => packet,
+                    Err(TryRecvError::Empty) => {
+                        return Err(AxError::WouldBlock);
+                    }
+                    Err(TryRecvError::Closed) => {
+                        return Ok(0);
+                    }
+                };
+                let count = dst.write(&data)?;
+                if count < data.len() {
+                    warn!("UDP message truncated: {} -> {} bytes", data.len(), count);
                 }
-                Err(TryRecvError::Closed) => {
-                    return Ok(0);
-                }
-            };
-            let count = dst.write(&data)?;
-            if count < data.len() {
-                warn!("UDP message truncated: {} -> {} bytes", data.len(), count);
-            }
 
-            if let Some(from) = options.from.as_mut() {
-                **from = SocketAddrEx::Unix(sender);
-            }
-            if let Some(dst) = options.cmsg.as_mut() {
-                dst.extend(cmsg);
-                if self.pass_credentials.load(Ordering::Relaxed) {
-                    dst.push(Box::new(sender_credentials));
+                if let Some(from) = options.from.as_mut() {
+                    **from = SocketAddrEx::Unix(sender);
                 }
-            }
+                if let Some(dst) = options.cmsg.as_mut() {
+                    dst.extend(cmsg);
+                    if self.pass_credentials.load(Ordering::Relaxed) {
+                        dst.push(Box::new(sender_credentials));
+                    }
+                }
 
-            Ok(if options.flags.contains(RecvFlags::TRUNCATE) {
-                data.len()
-            } else {
-                count
-            })
-        })
+                Ok(if options.flags.contains(RecvFlags::TRUNCATE) {
+                    data.len()
+                } else {
+                    count
+                })
+            },
+        )
     }
 }
 

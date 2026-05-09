@@ -14,12 +14,12 @@ use linux_raw_sys::general::*;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
-        inotify, with_fs,
+        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like, close_file_like,
+        get_file_like, inotify, with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
-    task::AsThread,
+    task::{AX_FILE_LIMIT, AsThread},
 };
 
 fn parent_watch_target(
@@ -217,15 +217,33 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
     Ok(0)
 }
 
-fn dup_fd(old_fd: c_int, cloexec: bool) -> AxResult<isize> {
+fn dup_fd(old_fd: c_int, min_fd: usize, cloexec: bool) -> AxResult<isize> {
     let f = get_file_like(old_fd)?;
-    let new_fd = add_file_like(f, cloexec)?;
-    Ok(new_fd as _)
+    let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE]
+        .current
+        .min(AX_FILE_LIMIT as u64) as usize;
+    if min_fd >= max_nofile {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut fd_table = FD_TABLE.write();
+    if fd_table.count() as u64 >= current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current
+    {
+        return Err(AxError::TooManyOpenFiles);
+    }
+    let mut fd = FileDescriptor { inner: f, cloexec };
+    for new_fd in min_fd..max_nofile {
+        match fd_table.add_at(new_fd, fd) {
+            Ok(_) => return Ok(new_fd as _),
+            Err(returned_fd) => fd = returned_fd,
+        }
+    }
+    Err(AxError::TooManyOpenFiles)
 }
 
 pub fn sys_dup(old_fd: c_int) -> AxResult<isize> {
     debug!("sys_dup <= {old_fd}");
-    dup_fd(old_fd, false)
+    dup_fd(old_fd, 0, false)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -271,8 +289,8 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
 
     match cmd as u32 {
-        F_DUPFD => dup_fd(fd, false),
-        F_DUPFD_CLOEXEC => dup_fd(fd, true),
+        F_DUPFD => dup_fd(fd, arg, false),
+        F_DUPFD_CLOEXEC => dup_fd(fd, arg, true),
         F_SETLK | F_SETLKW => Ok(0),
         F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
         F_GETLK | F_OFD_GETLK => {

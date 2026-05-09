@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -208,7 +210,7 @@ static int test_scm_rights(void) {
     recv_msg.msg_control = recv_control;
     recv_msg.msg_controllen = sizeof(recv_control);
 
-    if (recvmsg(socks[1], &recv_msg, 0) != 1 || recv_byte != 'x') {
+    if (recvmsg(socks[1], &recv_msg, MSG_CMSG_CLOEXEC) != 1 || recv_byte != 'x') {
         fprintf(stderr, "FAIL: recvmsg SCM_RIGHTS byte=%c errno=%s\n", recv_byte,
                 strerror(errno));
         close(sent_fd);
@@ -228,6 +230,16 @@ static int test_scm_rights(void) {
     }
     if (received_fd < 0) {
         fprintf(stderr, "FAIL: no received SCM_RIGHTS fd\n");
+        close(sent_fd);
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+    int received_fd_flags = fcntl(received_fd, F_GETFD);
+    if (received_fd_flags < 0 || (received_fd_flags & FD_CLOEXEC) == 0) {
+        fprintf(stderr, "FAIL: MSG_CMSG_CLOEXEC did not set FD_CLOEXEC flags=%#x errno=%s\n",
+                received_fd_flags, strerror(errno));
+        close(received_fd);
         close(sent_fd);
         close(socks[0]);
         close(socks[1]);
@@ -648,6 +660,679 @@ static int test_stream_credentials_follow_write_boundaries(void) {
     return 0;
 }
 
+static int test_nonblocking_unix_listener_accept(void) {
+    int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server < 0) {
+        fprintf(stderr, "FAIL: nonblocking listener socket: %s\n", strerror(errno));
+        return 1;
+    }
+    int flags = fcntl(server, F_GETFL);
+    if (flags < 0 || fcntl(server, F_SETFL, flags | O_NONBLOCK) != 0) {
+        fprintf(stderr, "FAIL: set listener O_NONBLOCK with fcntl: %s\n", strerror(errno));
+        close(server);
+        return 1;
+    }
+    flags = fcntl(server, F_GETFL);
+    if (flags < 0 || (flags & O_NONBLOCK) == 0) {
+        fprintf(stderr, "FAIL: listener F_GETFL flags=%#x errno=%s\n", flags, strerror(errno));
+        close(server);
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/fd-ipc-listener-%u.sock",
+             (unsigned)getpid());
+    unlink(addr.sun_path);
+
+    if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: bind nonblocking listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (listen(server, 4) != 0) {
+        fprintf(stderr, "FAIL: listen nonblocking listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (accept4(server, NULL, NULL, SOCK_CLOEXEC) >= 0 || errno != EAGAIN) {
+        fprintf(stderr, "FAIL: empty nonblocking accept errno=%s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        fprintf(stderr, "FAIL: nonblocking listener client socket: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: connect nonblocking listener client: %s\n", strerror(errno));
+        close(client);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int accepted = accept4(server, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (accepted < 0) {
+        fprintf(stderr, "FAIL: accept queued nonblocking listener client: %s\n", strerror(errno));
+        close(client);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    flags = fcntl(accepted, F_GETFL);
+    if (flags < 0 || (flags & O_NONBLOCK) == 0) {
+        fprintf(stderr, "FAIL: accepted SOCK_NONBLOCK flags=%#x errno=%s\n", flags,
+                strerror(errno));
+        close(accepted);
+        close(client);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (accept4(server, NULL, NULL, SOCK_CLOEXEC) >= 0 || errno != EAGAIN) {
+        fprintf(stderr, "FAIL: drained nonblocking accept errno=%s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    close(accepted);
+    close(client);
+    close(server);
+    unlink(addr.sun_path);
+    return 0;
+}
+
+static int test_socket_msg_dontwait(void) {
+    int socks[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socks) != 0) {
+        fprintf(stderr, "FAIL: socketpair MSG_DONTWAIT: %s\n", strerror(errno));
+        return 1;
+    }
+    int flags = fcntl(socks[0], F_GETFL);
+    if (flags < 0 || (flags & O_NONBLOCK) != 0) {
+        fprintf(stderr, "FAIL: fresh socketpair unexpectedly nonblocking flags=%#x errno=%s\n",
+                flags, strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+
+    char byte;
+    ssize_t n = recv(socks[0], &byte, sizeof(byte), MSG_DONTWAIT);
+    if (n != -1 || errno != EAGAIN) {
+        fprintf(stderr, "FAIL: empty recv MSG_DONTWAIT n=%zd errno=%s\n", n, strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+    flags = fcntl(socks[0], F_GETFL);
+    if (flags < 0 || (flags & O_NONBLOCK) != 0) {
+        fprintf(stderr, "FAIL: MSG_DONTWAIT changed O_NONBLOCK flags=%#x errno=%s\n", flags,
+                strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+
+    if (send(socks[1], "x", 1, MSG_DONTWAIT) != 1) {
+        fprintf(stderr, "FAIL: send MSG_DONTWAIT: %s\n", strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+    n = recv(socks[0], &byte, sizeof(byte), MSG_DONTWAIT);
+    if (n != 1 || byte != 'x') {
+        fprintf(stderr, "FAIL: recv MSG_DONTWAIT data n=%zd byte=%c errno=%s\n", n, byte,
+                strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        return 1;
+    }
+
+    close(socks[0]);
+    close(socks[1]);
+    return 0;
+}
+
+static int test_nonblocking_stream_sendmsg_partial(void) {
+    int socks[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, socks) != 0) {
+        fprintf(stderr, "FAIL: socketpair nonblocking sendmsg: %s\n", strerror(errno));
+        return 1;
+    }
+
+    char chunk[4096];
+    memset(chunk, 'p', sizeof(chunk));
+    struct iovec iov = {
+        .iov_base = chunk,
+        .iov_len = sizeof(chunk),
+    };
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    int attempts = 0;
+    for (;;) {
+        ssize_t n = sendmsg(socks[0], &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN) {
+                break;
+            }
+            fprintf(stderr, "FAIL: nonblocking sendmsg fill: %s\n", strerror(errno));
+            close(socks[0]);
+            close(socks[1]);
+            return 1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "FAIL: nonblocking sendmsg made no progress before EAGAIN\n");
+            close(socks[0]);
+            close(socks[1]);
+            return 1;
+        }
+        attempts++;
+        if (attempts > 1024) {
+            fprintf(stderr, "FAIL: nonblocking sendmsg did not reach EAGAIN\n");
+            close(socks[0]);
+            close(socks[1]);
+            return 1;
+        }
+    }
+
+    close(socks[0]);
+    close(socks[1]);
+    return 0;
+}
+
+static int test_epoll_unix_listener_and_client(void) {
+    int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server < 0) {
+        fprintf(stderr, "FAIL: epoll listener socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/fd-ipc-epoll-%u.sock",
+             (unsigned)getpid());
+    unlink(addr.sun_path);
+
+    if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: bind epoll listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (listen(server, 4) != 0) {
+        fprintf(stderr, "FAIL: listen epoll listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = 0x1234,
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl listener add: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    struct epoll_event out;
+    int ready = epoll_wait(epfd, &out, 1, 0);
+    if (ready != 0) {
+        fprintf(stderr, "FAIL: empty listener epoll_wait ready=%d events=%#x errno=%s\n", ready,
+                out.events, strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        fprintf(stderr, "FAIL: epoll listener client socket: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: connect epoll listener client: %s\n", strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    ready = epoll_wait(epfd, &out, 1, 1000);
+    if (ready != 1 || (out.events & EPOLLIN) == 0 || out.data.u64 != 0x1234) {
+        fprintf(stderr, "FAIL: listener epoll_wait ready=%d events=%#x data=%#llx errno=%s\n",
+                ready, out.events, (unsigned long long)out.data.u64, strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int accepted = accept4(server, NULL, NULL, SOCK_CLOEXEC);
+    if (accepted < 0) {
+        fprintf(stderr, "FAIL: accept epoll listener client: %s\n", strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 0x5678;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl accepted add: %s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    char byte;
+    if (recv(accepted, &byte, sizeof(byte), MSG_DONTWAIT) != -1 || errno != EAGAIN) {
+        fprintf(stderr, "FAIL: accepted empty recv MSG_DONTWAIT errno=%s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (send(client, "z", 1, MSG_DONTWAIT) != 1) {
+        fprintf(stderr, "FAIL: client send to accepted fd: %s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    ready = epoll_wait(epfd, &out, 1, 1000);
+    if (ready != 1 || (out.events & EPOLLIN) == 0 || out.data.u64 != 0x5678) {
+        fprintf(stderr, "FAIL: accepted epoll_wait ready=%d events=%#x data=%#llx errno=%s\n",
+                ready, out.events, (unsigned long long)out.data.u64, strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (recv(accepted, &byte, sizeof(byte), MSG_DONTWAIT) != 1 || byte != 'z') {
+        fprintf(stderr, "FAIL: accepted recv data byte=%c errno=%s\n", byte, strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    close(accepted);
+    close(client);
+    close(epfd);
+    close(server);
+    unlink(addr.sun_path);
+    return 0;
+}
+
+static int test_epoll_timeout_and_dupfd_readiness(void) {
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 dupfd: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct epoll_event out;
+    int ready = epoll_wait(epfd, &out, 1, 1);
+    if (ready != 0) {
+        fprintf(stderr, "FAIL: empty epoll_wait timeout ready=%d errno=%s\n", ready,
+                strerror(errno));
+        close(epfd);
+        return 1;
+    }
+
+    int socks[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socks) != 0) {
+        fprintf(stderr, "FAIL: socketpair dupfd readiness: %s\n", strerror(errno));
+        close(epfd);
+        return 1;
+    }
+
+    int dupfd = fcntl(socks[1], F_DUPFD_CLOEXEC, socks[1] + 16);
+    if (dupfd < socks[1] + 16) {
+        fprintf(stderr, "FAIL: F_DUPFD_CLOEXEC min fd dupfd=%d min=%d errno=%s\n", dupfd,
+                socks[1] + 16, strerror(errno));
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+    int fd_flags = fcntl(dupfd, F_GETFD);
+    if (fd_flags < 0 || (fd_flags & FD_CLOEXEC) == 0) {
+        fprintf(stderr, "FAIL: F_DUPFD_CLOEXEC flags=%#x errno=%s\n", fd_flags, strerror(errno));
+        close(dupfd);
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = 0x9abc,
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, dupfd, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl dupfd add: %s\n", strerror(errno));
+        close(dupfd);
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+    if (send(socks[0], "d", 1, MSG_DONTWAIT) != 1) {
+        fprintf(stderr, "FAIL: send dupfd peer: %s\n", strerror(errno));
+        close(dupfd);
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+    ready = epoll_wait(epfd, &out, 1, 1000);
+    if (ready != 1 || (out.events & EPOLLIN) == 0 || out.data.u64 != 0x9abc) {
+        fprintf(stderr, "FAIL: dupfd epoll_wait ready=%d events=%#x data=%#llx errno=%s\n",
+                ready, out.events, (unsigned long long)out.data.u64, strerror(errno));
+        close(dupfd);
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+
+    char byte = 0;
+    if (recv(dupfd, &byte, sizeof(byte), MSG_DONTWAIT) != 1 || byte != 'd') {
+        fprintf(stderr, "FAIL: recv dupfd byte=%c errno=%s\n", byte, strerror(errno));
+        close(dupfd);
+        close(socks[0]);
+        close(socks[1]);
+        close(epfd);
+        return 1;
+    }
+
+    close(dupfd);
+    close(socks[0]);
+    close(socks[1]);
+    close(epfd);
+    return 0;
+}
+
+static int test_wayland_like_accept_and_client_readiness(void) {
+    int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server < 0) {
+        fprintf(stderr, "FAIL: wayland-like listener socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/fd-ipc-wayland-%u.sock",
+             (unsigned)getpid());
+    unlink(addr.sun_path);
+
+    if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: bind wayland-like listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (listen(server, 128) != 0) {
+        fprintf(stderr, "FAIL: listen wayland-like listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 wayland-like listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = 0x1111,
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl wayland-like listener add: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    int server_dup = fcntl(server, F_DUPFD_CLOEXEC, 0);
+    if (server_dup < 0) {
+        fprintf(stderr, "FAIL: F_DUPFD_CLOEXEC wayland-like listener: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    int dup_epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (dup_epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 wayland-like listener dup: %s\n", strerror(errno));
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    event.events = EPOLLIN;
+    event.data.u64 = 0x3333;
+    if (epoll_ctl(dup_epfd, EPOLL_CTL_ADD, server_dup, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl wayland-like listener dup add: %s\n", strerror(errno));
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        fprintf(stderr, "FAIL: wayland-like client socket: %s\n", strerror(errno));
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: connect wayland-like client: %s\n", strerror(errno));
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    struct epoll_event out;
+    int ready = epoll_wait(dup_epfd, &out, 1, 1000);
+    if (ready != 1 || (out.events & EPOLLIN) == 0 || out.data.u64 != 0x3333) {
+        fprintf(stderr,
+                "FAIL: wayland-like listener dup epoll_wait ready=%d events=%#x data=%#llx "
+                "errno=%s\n",
+                ready, out.events, (unsigned long long)out.data.u64, strerror(errno));
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    struct sockaddr_un peer;
+    socklen_t peer_len = sizeof(peer);
+    int accepted = accept4(server, (struct sockaddr *)&peer, &peer_len, SOCK_CLOEXEC);
+    if (accepted < 0) {
+        fprintf(stderr, "FAIL: accept4 wayland-like client: %s\n", strerror(errno));
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    int fd_flags = fcntl(accepted, F_GETFD);
+    if (fd_flags < 0 || (fd_flags & FD_CLOEXEC) == 0) {
+        fprintf(stderr, "FAIL: wayland-like accepted cloexec flags=%#x errno=%s\n", fd_flags,
+                strerror(errno));
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    struct ucred peer_cred;
+    socklen_t peer_cred_len = sizeof(peer_cred);
+    memset(&peer_cred, 0, sizeof(peer_cred));
+    if (getsockopt(accepted, SOL_SOCKET, SO_PEERCRED, &peer_cred, &peer_cred_len) != 0) {
+        fprintf(stderr, "FAIL: wayland-like SO_PEERCRED: %s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int client_epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (client_epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 wayland-like client fd: %s\n", strerror(errno));
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    event.events = EPOLLIN;
+    event.data.u64 = 0x2222;
+    if (epoll_ctl(client_epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl wayland-like client fd add: %s\n", strerror(errno));
+        close(client_epfd);
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (send(client, "w", 1, MSG_DONTWAIT) != 1) {
+        fprintf(stderr, "FAIL: send wayland-like client byte: %s\n", strerror(errno));
+        close(client_epfd);
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    ready = epoll_wait(client_epfd, &out, 1, 1000);
+    if (ready != 1 || (out.events & EPOLLIN) == 0 || out.data.u64 != 0x2222) {
+        fprintf(stderr,
+                "FAIL: wayland-like accepted epoll_wait ready=%d events=%#x data=%#llx "
+                "errno=%s\n",
+                ready, out.events, (unsigned long long)out.data.u64, strerror(errno));
+        close(client_epfd);
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    char byte = 0;
+    if (recv(accepted, &byte, sizeof(byte), MSG_DONTWAIT) != 1 || byte != 'w') {
+        fprintf(stderr, "FAIL: recv wayland-like client byte=%c errno=%s\n", byte,
+                strerror(errno));
+        close(client_epfd);
+        close(accepted);
+        close(client);
+        close(dup_epfd);
+        close(server_dup);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    close(client_epfd);
+    close(accepted);
+    close(client);
+    close(dup_epfd);
+    close(server_dup);
+    close(epfd);
+    close(server);
+    unlink(addr.sun_path);
+    return 0;
+}
+
 int main(void) {
     if (test_proc_self_fd() != 0) {
         return 1;
@@ -664,8 +1349,26 @@ int main(void) {
     if (test_stream_credentials_follow_write_boundaries() != 0) {
         return 1;
     }
+    if (test_nonblocking_unix_listener_accept() != 0) {
+        return 1;
+    }
+    if (test_socket_msg_dontwait() != 0) {
+        return 1;
+    }
+    if (test_nonblocking_stream_sendmsg_partial() != 0) {
+        return 1;
+    }
+    if (test_epoll_unix_listener_and_client() != 0) {
+        return 1;
+    }
+    if (test_epoll_timeout_and_dupfd_readiness() != 0) {
+        return 1;
+    }
+    if (test_wayland_like_accept_and_client_readiness() != 0) {
+        return 1;
+    }
 
-    printf("fd, procfs, fcntl, ioctl, SCM_RIGHTS and socket credential tests passed\n");
+    printf("fd, procfs, fcntl, ioctl, SCM_RIGHTS, socket credential and listener tests passed\n");
     printf("All fd/ipc smoke tests passed!\n");
     return 0;
 }
