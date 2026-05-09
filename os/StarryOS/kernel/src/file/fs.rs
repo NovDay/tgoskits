@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, string::ToString, sync::Arc};
 use core::{
     ffi::c_int,
     hint::likely,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     task::Context,
 };
 
@@ -12,7 +12,10 @@ use ax_sync::Mutex;
 use ax_task::future::{block_on, poll_io};
 use axfs_ng_vfs::{Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_NONBLOCK};
+use linux_raw_sys::general::{
+    AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK,
+    F_SEAL_WRITE, O_NONBLOCK,
+};
 
 use super::{FileLike, Kstat, get_file_like};
 use crate::file::{IoDst, IoSrc};
@@ -101,6 +104,8 @@ pub struct File {
     inner: ax_fs::File,
     open_flags: u32,
     nonblock: AtomicBool,
+    memfd: bool,
+    seals: AtomicU32,
 }
 
 impl File {
@@ -109,7 +114,18 @@ impl File {
             inner,
             open_flags: open_flags & !O_NONBLOCK,
             nonblock: AtomicBool::new(open_flags & O_NONBLOCK != 0),
+            memfd: false,
+            seals: AtomicU32::new(0),
         }
+    }
+
+    pub fn new_memfd(inner: ax_fs::File, open_flags: u32, allow_sealing: bool) -> Self {
+        let mut file = Self::new(inner, open_flags);
+        file.memfd = true;
+        if !allow_sealing {
+            file.seals.store(F_SEAL_SEAL, Ordering::Release);
+        }
+        file
     }
 
     pub fn inner(&self) -> &ax_fs::File {
@@ -124,6 +140,79 @@ impl File {
         self.inner
             .flags()
             .intersects(FileFlags::WRITE | FileFlags::APPEND)
+    }
+
+    pub fn add_seals(&self, seals: u32) -> AxResult {
+        const VALID_SEALS: u32 = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+
+        if !self.memfd || seals & !VALID_SEALS != 0 {
+            return Err(AxError::InvalidInput);
+        }
+
+        let mut current = self.seals.load(Ordering::Acquire);
+        loop {
+            if current & F_SEAL_SEAL != 0 {
+                return Err(AxError::OperationNotPermitted);
+            }
+            let next = current | seals;
+            match self.seals.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn seals(&self) -> AxResult<u32> {
+        if !self.memfd {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.seals.load(Ordering::Acquire))
+    }
+
+    pub fn can_resize_to(&self, new_len: u64) -> AxResult {
+        let seals = self.seals.load(Ordering::Acquire);
+        if seals & (F_SEAL_GROW | F_SEAL_SHRINK) == 0 {
+            return Ok(());
+        }
+
+        let current_len = self.inner.location().metadata()?.size;
+        if new_len > current_len && seals & F_SEAL_GROW != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if new_len < current_len && seals & F_SEAL_SHRINK != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
+    }
+
+    pub fn can_write_sealed(&self) -> AxResult {
+        if self.seals.load(Ordering::Acquire) & F_SEAL_WRITE != 0 {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
+    }
+
+    pub fn can_write_range(&self, offset: u64, len: usize) -> AxResult {
+        self.can_write_sealed()?;
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or(AxError::InvalidInput)?;
+        if self.seals.load(Ordering::Acquire) & F_SEAL_GROW == 0 {
+            return Ok(());
+        }
+        let current_len = self.inner.location().metadata()?.size;
+        if end > current_len {
+            return Err(AxError::OperationNotPermitted);
+        }
+        Ok(())
     }
 }
 
@@ -145,6 +234,7 @@ impl FileLike for File {
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.can_write_sealed()?;
         let inner = self.inner();
         let written = if likely(self.is_blocking()) {
             inner.write(src)

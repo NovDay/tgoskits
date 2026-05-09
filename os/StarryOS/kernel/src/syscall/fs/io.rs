@@ -165,6 +165,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let f = File::from_fd(fd)?;
+    f.can_resize_to(length as _)?;
     f.inner().access(FileFlags::WRITE)?.set_len(length as _)?;
     inotify::notify_file_modified(&f.path());
     Ok(0)
@@ -195,7 +196,9 @@ pub fn sys_fallocate(
     }
     let inner = f.inner();
     let file = inner.access(FileFlags::WRITE)?;
-    file.set_len(file.location().len()?.max(end))?;
+    let new_len = file.location().len()?.max(end);
+    f.can_resize_to(new_len)?;
+    file.set_len(new_len)?;
     inotify::notify_file_modified(&f.path());
     Ok(0)
 }
@@ -284,6 +287,7 @@ pub fn sys_pwrite64(
     if len == 0 {
         return Ok(0);
     }
+    f.can_write_range(offset as _, len)?;
     let data = copy_user_read_buf(buf, len)?;
     let write = f.inner().write_at(data.as_slice(), offset as _)?;
     if write > 0 {
@@ -370,6 +374,7 @@ pub fn sys_pwritev2(
     } else {
         let data = copy_user_iov_read_buf(iov, iovcnt)?;
         let f = file_or_espipe(fd)?;
+        f.can_write_range(offset as _, data.len())?;
         let write = f.inner().write_at(data.as_slice(), offset as _)?;
         if write > 0 {
             inotify::notify_file_modified(&f.path());

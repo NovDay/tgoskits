@@ -359,6 +359,15 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             pipe.resize(arg)?;
             Ok(0)
         }
+        F_ADD_SEALS => {
+            let file = File::from_fd(fd)?;
+            file.add_seals(arg as _)?;
+            Ok(0)
+        }
+        F_GET_SEALS => {
+            let file = File::from_fd(fd)?;
+            Ok(file.seals()? as _)
+        }
         _ => {
             warn!("unsupported fcntl parameters: cmd: {cmd}");
             Ok(0)

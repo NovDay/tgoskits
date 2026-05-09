@@ -1,6 +1,7 @@
 args = [
   "-m",
   "512M",
+  "-no-reboot",
   "-display",
   "none",
   "-serial",
@@ -35,6 +36,7 @@ test_commands = [
   "/usr/bin/glib-smoke",
   "/usr/bin/dbus-smoke",
   "/usr/bin/wayland-smoke",
+  "/usr/bin/wayland-process-smoke",
   "/usr/bin/gtk-smoke",
 ]
 success_regex = ["(?m)^STARRY_GROUPED_TESTS_PASSED\\s*$"]
