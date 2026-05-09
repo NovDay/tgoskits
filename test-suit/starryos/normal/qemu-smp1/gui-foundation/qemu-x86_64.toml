@@ -27,6 +27,7 @@ shell_prefix = "root@starry:"
 test_commands = [
   "/usr/bin/fb-demo",
   "/usr/bin/drm-smoke",
+  "/usr/bin/libdrm-smoke",
   "/usr/bin/evdev-smoke",
   "/usr/bin/timerfd-smoke",
   "/usr/bin/inotify-smoke",

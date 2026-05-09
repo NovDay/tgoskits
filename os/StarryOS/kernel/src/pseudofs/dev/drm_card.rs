@@ -23,8 +23,12 @@ const DRM_IOCTL_MODE_GETCRTC: u32 = 0xc068_64a1;
 const DRM_IOCTL_MODE_SETCRTC: u32 = 0xc068_64a2;
 const DRM_IOCTL_MODE_GETENCODER: u32 = 0xc014_64a6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xc050_64a7;
+const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xc040_64aa;
 const DRM_IOCTL_MODE_PAGE_FLIP: u32 = 0xc018_64b0;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xc010_64b5;
+const DRM_IOCTL_MODE_GETPLANE: u32 = 0xc020_64b6;
 const DRM_IOCTL_MODE_ADDFB2: u32 = 0xc068_64b8;
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xc020_64b9;
 const DRM_IOCTL_MODE_CREATE_DUMB: u32 = 0xc020_64b2;
 const DRM_IOCTL_MODE_MAP_DUMB: u32 = 0xc010_64b3;
 const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xc004_64b4;
@@ -39,6 +43,7 @@ const DRIVER_DESC: &[u8] = b"StarryOS framebuffer-backed DRM stub";
 const CRTC_ID: u32 = 32;
 const CONNECTOR_ID: u32 = 64;
 const ENCODER_ID: u32 = 96;
+const PLANE_ID: u32 = 112;
 
 const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
 const DRM_MODE_TYPE_DRIVER: u32 = 1 << 6;
@@ -46,10 +51,16 @@ const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_MODE_SUBPIXEL_UNKNOWN: u32 = 1;
 const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
+const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+const DRM_MODE_OBJECT_ANY: u32 = 0;
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 const DRM_FORMAT_XRGB8888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
 const DRM_FORMAT_ARGB8888: u32 = fourcc_code(b'A', b'R', b'2', b'4');
+const PLANE_FORMATS: &[u32] = &[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
 const MAX_DUMB_BUFFERS: usize = 8;
 const MAX_FRAMEBUFFERS: usize = 8;
 const MAX_DRM_EVENTS: usize = 16;
@@ -159,6 +170,47 @@ struct DrmModeGetConnector {
     mm_height: u32,
     subpixel: u32,
     pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmModeGetProperty {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    prop_id: u32,
+    flags: u32,
+    name: [u8; 32],
+    count_values: u32,
+    count_enum_blobs: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmModeGetPlaneRes {
+    plane_id_ptr: u64,
+    count_planes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmModeGetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    possible_crtcs: u32,
+    gamma_size: u32,
+    count_format_types: u32,
+    format_type_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmModeObjGetProperties {
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_props: u32,
+    obj_id: u32,
+    obj_type: u32,
 }
 
 #[repr(C)]
@@ -313,8 +365,12 @@ impl DeviceOps for DrmCard {
             DRM_IOCTL_MODE_SETCRTC => drm_mode_setcrtc(arg),
             DRM_IOCTL_MODE_GETENCODER => drm_mode_getencoder(arg),
             DRM_IOCTL_MODE_GETCONNECTOR => drm_mode_getconnector(arg),
+            DRM_IOCTL_MODE_GETPROPERTY => drm_mode_getproperty(arg),
             DRM_IOCTL_MODE_PAGE_FLIP => drm_mode_page_flip(arg),
+            DRM_IOCTL_MODE_GETPLANERESOURCES => drm_mode_getplaneresources(arg),
+            DRM_IOCTL_MODE_GETPLANE => drm_mode_getplane(arg),
             DRM_IOCTL_MODE_ADDFB2 => drm_mode_addfb2(arg),
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => drm_mode_obj_getproperties(arg),
             DRM_IOCTL_MODE_CREATE_DUMB => drm_mode_create_dumb(arg),
             DRM_IOCTL_MODE_MAP_DUMB => drm_mode_map_dumb(arg),
             DRM_IOCTL_MODE_DESTROY_DUMB => drm_mode_destroy_dumb(arg),
@@ -607,6 +663,85 @@ fn drm_mode_getconnector(arg: usize) -> VfsResult<usize> {
     Ok(0)
 }
 
+fn drm_mode_getproperty(arg: usize) -> VfsResult<usize> {
+    if arg == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let property = unsafe {
+        (arg as *const DrmModeGetProperty)
+            .vm_read_uninit()?
+            .assume_init()
+    };
+    if property.prop_id == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Err(AxError::InvalidInput)
+}
+
+fn drm_mode_getplaneresources(arg: usize) -> VfsResult<usize> {
+    if arg == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let mut resources = unsafe {
+        (arg as *const DrmModeGetPlaneRes)
+            .vm_read_uninit()?
+            .assume_init()
+    };
+    if resources.plane_id_ptr != 0 && resources.count_planes != 0 {
+        vm_write_drm_ids(resources.plane_id_ptr, &[PLANE_ID], resources.count_planes)?;
+    }
+    resources.count_planes = 1;
+    (arg as *mut DrmModeGetPlaneRes).vm_write(resources)?;
+    Ok(0)
+}
+
+fn drm_mode_getplane(arg: usize) -> VfsResult<usize> {
+    if arg == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let mut plane = unsafe {
+        (arg as *const DrmModeGetPlane)
+            .vm_read_uninit()?
+            .assume_init()
+    };
+    if plane.plane_id != PLANE_ID {
+        return Err(AxError::InvalidInput);
+    }
+    if plane.format_type_ptr != 0 && plane.count_format_types != 0 {
+        vm_write_drm_ids(
+            plane.format_type_ptr,
+            PLANE_FORMATS,
+            plane.count_format_types,
+        )?;
+    }
+    let state = DRM_STATE.lock();
+    plane.crtc_id = CRTC_ID;
+    plane.fb_id = state.current_fb_id;
+    drop(state);
+    plane.possible_crtcs = 1;
+    plane.gamma_size = 0;
+    plane.count_format_types = PLANE_FORMATS.len() as u32;
+    (arg as *mut DrmModeGetPlane).vm_write(plane)?;
+    Ok(0)
+}
+
+fn drm_mode_obj_getproperties(arg: usize) -> VfsResult<usize> {
+    if arg == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let mut properties = unsafe {
+        (arg as *const DrmModeObjGetProperties)
+            .vm_read_uninit()?
+            .assume_init()
+    };
+    if !is_known_drm_object(properties.obj_id, properties.obj_type) {
+        return Err(AxError::InvalidInput);
+    }
+    properties.count_props = 0;
+    (arg as *mut DrmModeObjGetProperties).vm_write(properties)?;
+    Ok(0)
+}
+
 fn drm_mode_create_dumb(arg: usize) -> VfsResult<usize> {
     if arg == 0 {
         return Err(AxError::BadAddress);
@@ -794,6 +929,19 @@ fn current_modeinfo() -> DrmModeModeInfo {
         flags: 0,
         type_: DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER,
         name,
+    }
+}
+
+fn is_known_drm_object(id: u32, object_type: u32) -> bool {
+    match object_type {
+        DRM_MODE_OBJECT_ANY => {
+            id == CRTC_ID || id == CONNECTOR_ID || id == ENCODER_ID || id == PLANE_ID
+        }
+        DRM_MODE_OBJECT_CRTC => id == CRTC_ID,
+        DRM_MODE_OBJECT_CONNECTOR => id == CONNECTOR_ID,
+        DRM_MODE_OBJECT_ENCODER => id == ENCODER_ID,
+        DRM_MODE_OBJECT_PLANE => id == PLANE_ID,
+        _ => false,
     }
 }
 

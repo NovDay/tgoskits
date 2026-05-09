@@ -20,8 +20,12 @@
 #define DRM_IOCTL_MODE_SETCRTC 0xc06864a2
 #define DRM_IOCTL_MODE_GETENCODER 0xc01464a6
 #define DRM_IOCTL_MODE_GETCONNECTOR 0xc05064a7
+#define DRM_IOCTL_MODE_GETPROPERTY 0xc04064aa
 #define DRM_IOCTL_MODE_PAGE_FLIP 0xc01864b0
+#define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5
+#define DRM_IOCTL_MODE_GETPLANE 0xc02064b6
 #define DRM_IOCTL_MODE_ADDFB2 0xc06864b8
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xc02064b9
 #define DRM_IOCTL_MODE_CREATE_DUMB 0xc02064b2
 #define DRM_IOCTL_MODE_MAP_DUMB 0xc01064b3
 #define DRM_IOCTL_MODE_DESTROY_DUMB 0xc00464b4
@@ -35,9 +39,14 @@
 #define DRM_MODE_CONNECTED 1
 #define DRM_MODE_SUBPIXEL_UNKNOWN 1
 #define DRM_MODE_ENCODER_VIRTUAL 5
+#define DRM_MODE_OBJECT_CRTC 0xccccccccU
+#define DRM_MODE_OBJECT_CONNECTOR 0xc0c0c0c0U
+#define DRM_MODE_OBJECT_ENCODER 0xe0e0e0e0U
+#define DRM_MODE_OBJECT_PLANE 0xeeeeeeeeU
 #define DRM_MODE_PAGE_FLIP_EVENT 0x1
 #define DRM_EVENT_FLIP_COMPLETE 0x02
 #define DRM_FORMAT_XRGB8888 0x34325258U
+#define DRM_FORMAT_ARGB8888 0x34325241U
 
 struct fb_fix_screeninfo {
     uint8_t id[16];
@@ -146,6 +155,39 @@ struct drm_mode_get_connector {
     uint32_t pad;
 };
 
+struct drm_mode_get_property {
+    uint64_t values_ptr;
+    uint64_t enum_blob_ptr;
+    uint32_t prop_id;
+    uint32_t flags;
+    char name[32];
+    uint32_t count_values;
+    uint32_t count_enum_blobs;
+};
+
+struct drm_mode_get_plane_res {
+    uint64_t plane_id_ptr;
+    uint32_t count_planes;
+};
+
+struct drm_mode_get_plane {
+    uint32_t plane_id;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t possible_crtcs;
+    uint32_t gamma_size;
+    uint32_t count_format_types;
+    uint64_t format_type_ptr;
+};
+
+struct drm_mode_obj_get_properties {
+    uint64_t props_ptr;
+    uint64_t prop_values_ptr;
+    uint32_t count_props;
+    uint32_t obj_id;
+    uint32_t obj_type;
+};
+
 struct drm_mode_create_dumb {
     uint32_t height;
     uint32_t width;
@@ -204,6 +246,7 @@ struct drm_resource_ids {
     uint32_t crtc_id;
     uint32_t connector_id;
     uint32_t encoder_id;
+    uint32_t plane_id;
     uint32_t max_width;
     uint32_t max_height;
 };
@@ -473,6 +516,116 @@ static int expect_kms_topology(int fd, const struct drm_resource_ids *ids) {
     return 0;
 }
 
+static int expect_object_has_no_properties(int fd, uint32_t obj_id, uint32_t obj_type) {
+    uint32_t prop_id = UINT32_MAX;
+    uint64_t prop_value = UINT64_MAX;
+    struct drm_mode_obj_get_properties props = {
+        .props_ptr = (uintptr_t)&prop_id,
+        .prop_values_ptr = (uintptr_t)&prop_value,
+        .count_props = 1,
+        .obj_id = obj_id,
+        .obj_type = obj_type,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &props) != 0) {
+        fprintf(stderr, "FAIL: MODE_OBJ_GETPROPERTIES obj=%u type=%#x: %s\n", obj_id,
+                obj_type, strerror(errno));
+        return 1;
+    }
+    if (props.count_props != 0 || prop_id != UINT32_MAX || prop_value != UINT64_MAX) {
+        fprintf(stderr,
+                "FAIL: object properties obj=%u type=%#x count=%u prop=%u value=%#llx\n",
+                obj_id, obj_type, props.count_props, prop_id, (unsigned long long)prop_value);
+        return 1;
+    }
+    return 0;
+}
+
+static int expect_plane_and_properties(int fd, struct drm_resource_ids *ids) {
+    struct drm_mode_get_plane_res plane_res = {0};
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_res) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPLANERESOURCES count probe: %s\n", strerror(errno));
+        return 1;
+    }
+    if (plane_res.count_planes != 1) {
+        fprintf(stderr, "FAIL: plane resource count=%u\n", plane_res.count_planes);
+        return 1;
+    }
+
+    ids->plane_id = 0;
+    plane_res.plane_id_ptr = (uintptr_t)&ids->plane_id;
+    plane_res.count_planes = 1;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_res) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPLANERESOURCES id probe: %s\n", strerror(errno));
+        return 1;
+    }
+    if (ids->plane_id == 0 || plane_res.count_planes != 1) {
+        fprintf(stderr, "FAIL: plane id=%u count=%u\n", ids->plane_id, plane_res.count_planes);
+        return 1;
+    }
+
+    uint32_t zero_count_plane_id = UINT32_MAX;
+    plane_res.plane_id_ptr = (uintptr_t)&zero_count_plane_id;
+    plane_res.count_planes = 0;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_res) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPLANERESOURCES zero-count probe: %s\n",
+                strerror(errno));
+        return 1;
+    }
+    if (zero_count_plane_id != UINT32_MAX || plane_res.count_planes != 1) {
+        fprintf(stderr, "FAIL: zero-count plane id=%u count=%u\n", zero_count_plane_id,
+                plane_res.count_planes);
+        return 1;
+    }
+
+    struct drm_mode_get_plane plane = {
+        .plane_id = ids->plane_id,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPLANE count probe: %s\n", strerror(errno));
+        return 1;
+    }
+    if (plane.crtc_id != ids->crtc_id || plane.possible_crtcs != 1 || plane.gamma_size != 0 ||
+        plane.count_format_types != 2) {
+        fprintf(stderr, "FAIL: plane state crtc=%u possible=%#x gamma=%u formats=%u\n",
+                plane.crtc_id, plane.possible_crtcs, plane.gamma_size,
+                plane.count_format_types);
+        return 1;
+    }
+
+    uint32_t formats[2] = {0, 0};
+    plane.format_type_ptr = (uintptr_t)formats;
+    plane.count_format_types = 2;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPLANE format probe: %s\n", strerror(errno));
+        return 1;
+    }
+    if (formats[0] != DRM_FORMAT_XRGB8888 || formats[1] != DRM_FORMAT_ARGB8888 ||
+        plane.count_format_types != 2) {
+        fprintf(stderr, "FAIL: plane formats=%#x/%#x count=%u\n", formats[0], formats[1],
+                plane.count_format_types);
+        return 1;
+    }
+
+    if (expect_object_has_no_properties(fd, ids->crtc_id, DRM_MODE_OBJECT_CRTC) != 0 ||
+        expect_object_has_no_properties(fd, ids->connector_id, DRM_MODE_OBJECT_CONNECTOR) != 0 ||
+        expect_object_has_no_properties(fd, ids->encoder_id, DRM_MODE_OBJECT_ENCODER) != 0 ||
+        expect_object_has_no_properties(fd, ids->plane_id, DRM_MODE_OBJECT_PLANE) != 0) {
+        return 1;
+    }
+
+    struct drm_mode_get_property property = {
+        .prop_id = 1,
+    };
+    errno = 0;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) == 0 || errno != EINVAL) {
+        fprintf(stderr, "FAIL: MODE_GETPROPERTY unknown property errno=%s\n", strerror(errno));
+        return 1;
+    }
+
+    printf("KMS plane resources and empty object property probes passed\n");
+    return 0;
+}
+
 static int expect_kms_dumb_scanout(int fd, const struct drm_resource_ids *ids) {
     const uint32_t width = ids->max_width >= 8 ? 8 : ids->max_width;
     const uint32_t height = ids->max_height >= 8 ? 8 : ids->max_height;
@@ -700,7 +853,8 @@ int main(void) {
     if (expect_version(fd) != 0 || expect_cap(fd, DRM_CAP_DUMB_BUFFER, 1) != 0 ||
         expect_cap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, 1) != 0 || ioctl(fd, DRM_IOCTL_SET_MASTER) != 0 ||
         ioctl(fd, DRM_IOCTL_DROP_MASTER) != 0 || expect_getresources(fd, &ids) != 0 ||
-        expect_kms_topology(fd, &ids) != 0 || expect_kms_dumb_scanout(fd, &ids) != 0) {
+        expect_kms_topology(fd, &ids) != 0 || expect_plane_and_properties(fd, &ids) != 0 ||
+        expect_kms_dumb_scanout(fd, &ids) != 0) {
         close(fd);
         return 1;
     }
