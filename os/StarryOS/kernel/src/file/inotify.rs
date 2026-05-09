@@ -13,7 +13,10 @@ use core::{
 use ax_errno::{AxError, AxResult};
 use ax_task::future::{block_on, poll_io};
 use axpoll::{IoEvents, PollSet, Pollable};
-use linux_raw_sys::general::{IN_IGNORED, IN_MASK_ADD, IN_MASK_CREATE, inotify_event};
+use linux_raw_sys::general::{
+    IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_DELETE_SELF, IN_IGNORED, IN_ISDIR, IN_MASK_ADD,
+    IN_MASK_CREATE, IN_MODIFY, IN_OPEN, inotify_event,
+};
 use spin::{Lazy, Mutex};
 
 use crate::file::{FileLike, IoDst, IoSrc};
@@ -154,6 +157,42 @@ impl InotifyFd {
         }
     }
 
+    fn queue_deleted_event(&self, path: &str, mask: u32) {
+        let queued = {
+            let mut state = self.state.lock();
+            let mut removed = Vec::new();
+            let mut events = Vec::new();
+            for (wd, watch) in state.watches.iter() {
+                if watch.path == path {
+                    if watch.mask & mask != 0 {
+                        events.push(QueuedEvent {
+                            wd: *wd,
+                            mask,
+                            cookie: 0,
+                            name: String::new(),
+                        });
+                    }
+                    events.push(QueuedEvent {
+                        wd: *wd,
+                        mask: IN_IGNORED,
+                        cookie: 0,
+                        name: String::new(),
+                    });
+                    removed.push(*wd);
+                }
+            }
+            for wd in removed {
+                state.watches.remove(&wd);
+            }
+            let queued = !events.is_empty();
+            state.events.extend(events);
+            queued
+        };
+        if queued {
+            self.poll_rx.wake();
+        }
+    }
+
     fn pop_event(&self, dst: &mut IoDst) -> AxResult<usize> {
         let (event, name_len, event_size) = {
             let mut state = self.state.lock();
@@ -211,10 +250,42 @@ pub fn notify_child_event(parent_path: &str, name: &str, mask: u32, cookie: u32)
 }
 
 pub fn notify_file_modified(path: &str) {
-    notify_path_event(path, linux_raw_sys::general::IN_MODIFY, 0);
+    notify_path_event(path, IN_MODIFY, 0);
     if let Some((parent, name)) = split_parent_name(path) {
-        notify_child_event(parent, name, linux_raw_sys::general::IN_MODIFY, 0);
+        notify_child_event(parent, name, IN_MODIFY, 0);
     }
+}
+
+pub fn notify_opened(path: &str, is_dir: bool) {
+    let mask = IN_OPEN | if is_dir { IN_ISDIR } else { 0 };
+    notify_path_event(path, mask, 0);
+    if let Some((parent, name)) = split_parent_name(path) {
+        notify_child_event(parent, name, mask, 0);
+    }
+}
+
+pub fn notify_closed(path: &str, writable: bool, is_dir: bool) {
+    let mask = (if writable {
+        IN_CLOSE_WRITE
+    } else {
+        IN_CLOSE_NOWRITE
+    }) | if is_dir { IN_ISDIR } else { 0 };
+    notify_path_event(path, mask, 0);
+    if let Some((parent, name)) = split_parent_name(path) {
+        notify_child_event(parent, name, mask, 0);
+    }
+}
+
+pub fn notify_attrib(path: &str) {
+    notify_path_event(path, IN_ATTRIB, 0);
+    if let Some((parent, name)) = split_parent_name(path) {
+        notify_child_event(parent, name, IN_ATTRIB, 0);
+    }
+}
+
+pub fn notify_deleted(path: &str, is_dir: bool) {
+    let self_mask = IN_DELETE_SELF | if is_dir { IN_ISDIR } else { 0 };
+    with_live_inotify_fds(|inotify| inotify.queue_deleted_event(path, self_mask));
 }
 
 fn split_parent_name(path: &str) -> Option<(&str, &str)> {

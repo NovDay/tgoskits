@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -55,6 +56,59 @@ static int expect_named_event(int fd, int wd, uint32_t mask, const char *name) {
         return 1;
     }
     return 0;
+}
+
+static int expect_unnamed_event(int fd, int wd, uint32_t mask) {
+    struct inotify_event event;
+    if (read_event(fd, &event, sizeof(event)) != 0) {
+        return 1;
+    }
+    if (event.wd != wd || event.mask != mask || event.cookie != 0 || event.len != 0) {
+        fprintf(stderr, "FAIL: unnamed inotify event wd=%d mask=%#x cookie=%u len=%u expected wd=%d mask=%#x\n",
+                event.wd, event.mask, event.cookie, event.len, wd, mask);
+        return 1;
+    }
+    return 0;
+}
+
+static bool is_named_event(const struct inotify_event *event, int wd, uint32_t mask,
+                           const char *name) {
+    return event->wd == wd && event->mask == mask && event->len != 0 &&
+           strcmp(event->name, name) == 0;
+}
+
+static bool is_unnamed_event(const struct inotify_event *event, int wd, uint32_t mask) {
+    return event->wd == wd && event->mask == mask && event->cookie == 0 && event->len == 0;
+}
+
+static int expect_named_and_unnamed_events(int fd, int named_wd, uint32_t named_mask,
+                                           const char *name, int unnamed_wd,
+                                           uint32_t unnamed_mask) {
+    char first_buf[sizeof(struct inotify_event) + 64];
+    char second_buf[sizeof(struct inotify_event) + 64];
+    struct inotify_event *first = (struct inotify_event *)first_buf;
+    struct inotify_event *second = (struct inotify_event *)second_buf;
+
+    if (read_event(fd, first, sizeof(first_buf)) != 0 ||
+        read_event(fd, second, sizeof(second_buf)) != 0) {
+        return 1;
+    }
+
+    bool first_named = is_named_event(first, named_wd, named_mask, name);
+    bool second_named = is_named_event(second, named_wd, named_mask, name);
+    bool first_unnamed = is_unnamed_event(first, unnamed_wd, unnamed_mask);
+    bool second_unnamed = is_unnamed_event(second, unnamed_wd, unnamed_mask);
+
+    if ((first_named && second_unnamed) || (first_unnamed && second_named)) {
+        return 0;
+    }
+
+    fprintf(stderr,
+            "FAIL: paired inotify events first=(wd=%d mask=%#x len=%u name=%s) second=(wd=%d mask=%#x len=%u name=%s) expected named wd=%d mask=%#x name=%s and unnamed wd=%d mask=%#x\n",
+            first->wd, first->mask, first->len, first->len == 0 ? "(none)" : first->name,
+            second->wd, second->mask, second->len, second->len == 0 ? "(none)" : second->name,
+            named_wd, named_mask, name, unnamed_wd, unnamed_mask);
+    return 1;
 }
 
 int main(void) {
@@ -145,7 +199,10 @@ int main(void) {
         return 1;
     }
 
-    int dir_wd = inotify_add_watch_raw(fd, dir_path, IN_CREATE | IN_DELETE | IN_MODIFY | IN_ONLYDIR);
+    int dir_wd = inotify_add_watch_raw(fd, dir_path,
+                                       IN_CREATE | IN_DELETE | IN_MODIFY | IN_OPEN |
+                                           IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_ATTRIB |
+                                           IN_ONLYDIR);
     if (dir_wd < 0) {
         fprintf(stderr, "FAIL: inotify_add_watch %s: %s\n", dir_path, strerror(errno));
         close(fd);
@@ -161,6 +218,13 @@ int main(void) {
         return 1;
     }
     if (expect_named_event(fd, dir_wd, IN_CREATE, file_name) != 0) {
+        close(file_fd);
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_named_event(fd, dir_wd, IN_OPEN, file_name) != 0) {
         close(file_fd);
         close(fd);
         unlink(file_path);
@@ -185,6 +249,108 @@ int main(void) {
     }
 
     close(file_fd);
+    if (expect_named_event(fd, dir_wd, IN_CLOSE_WRITE, file_name) != 0) {
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
+    int read_fd = open(file_path, O_RDONLY);
+    if (read_fd < 0) {
+        fprintf(stderr, "FAIL: open read-only watched file: %s\n", strerror(errno));
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_named_event(fd, dir_wd, IN_OPEN, file_name) != 0) {
+        close(read_fd);
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    close(read_fd);
+    if (expect_named_event(fd, dir_wd, IN_CLOSE_NOWRITE, file_name) != 0) {
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
+    int opened_dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY);
+    if (opened_dir_fd < 0) {
+        fprintf(stderr, "FAIL: open watched directory: %s\n", strerror(errno));
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_unnamed_event(fd, dir_wd, IN_OPEN | IN_ISDIR) != 0) {
+        close(opened_dir_fd);
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    close(opened_dir_fd);
+    if (expect_unnamed_event(fd, dir_wd, IN_CLOSE_NOWRITE | IN_ISDIR) != 0) {
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
+    int file_wd = inotify_add_watch_raw(fd, file_path,
+                                        IN_OPEN | IN_CLOSE_NOWRITE | IN_ATTRIB | IN_DELETE_SELF);
+    if (file_wd < 0) {
+        fprintf(stderr, "FAIL: inotify_add_watch file %s: %s\n", file_path, strerror(errno));
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
+    read_fd = open(file_path, O_RDONLY);
+    if (read_fd < 0) {
+        fprintf(stderr, "FAIL: open file watch read-only: %s\n", strerror(errno));
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_named_and_unnamed_events(fd, dir_wd, IN_OPEN, file_name, file_wd, IN_OPEN) != 0) {
+        close(read_fd);
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    close(read_fd);
+    if (expect_named_and_unnamed_events(fd, dir_wd, IN_CLOSE_NOWRITE, file_name, file_wd,
+                                        IN_CLOSE_NOWRITE) != 0) {
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
+    if (chmod(file_path, 0640) != 0) {
+        fprintf(stderr, "FAIL: chmod watched file: %s\n", strerror(errno));
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_named_and_unnamed_events(fd, dir_wd, IN_ATTRIB, file_name, file_wd, IN_ATTRIB) !=
+        0) {
+        close(fd);
+        unlink(file_path);
+        rmdir(dir_path);
+        return 1;
+    }
+
     if (unlink(file_path) != 0) {
         fprintf(stderr, "FAIL: unlink watched file: %s\n", strerror(errno));
         close(fd);
@@ -192,6 +358,16 @@ int main(void) {
         return 1;
     }
     if (expect_named_event(fd, dir_wd, IN_DELETE, file_name) != 0) {
+        close(fd);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_unnamed_event(fd, file_wd, IN_DELETE_SELF) != 0) {
+        close(fd);
+        rmdir(dir_path);
+        return 1;
+    }
+    if (expect_unnamed_event(fd, file_wd, IN_IGNORED) != 0) {
         close(fd);
         rmdir(dir_path);
         return 1;

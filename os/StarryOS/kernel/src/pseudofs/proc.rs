@@ -90,6 +90,29 @@ const DUMMY_MEMINFO: &str = indoc! {"
     DirectMap1G:     1048576 kB
 "};
 
+const PROC_MOUNTS: &str = indoc! {"
+    rootfs / rootfs rw 0 0
+    tmpfs /dev tmpfs rw,nosuid 0 0
+    tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+    tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
+    tmpfs /run tmpfs rw,nosuid,nodev 0 0
+    proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+    sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+"};
+
+struct TaskStatusFields<'a> {
+    name: &'a str,
+    tgid: u32,
+    pid: u64,
+    ppid: u32,
+    pgid: u32,
+    sid: u32,
+    thread_count: usize,
+    cred: &'a crate::task::Cred,
+    cpus_allowed: &'a str,
+    cpus_allowed_list: &'a str,
+}
+
 pub fn new_procfs() -> Filesystem {
     SimpleFs::new_with("proc".into(), 0x9fa0, builder)
 }
@@ -137,48 +160,94 @@ impl SimpleDirOps for ProcessTaskDir {
 fn task_status(task: &AxTaskRef) -> String {
     let thread = task.as_thread();
     let cred = thread.cred();
-    render_task_status(
-        thread.proc_data.proc.pid(),
-        task.id().as_u64(),
-        &cred,
-        task.cpumask(),
-        ax_hal::cpu_num(),
-    )
-}
+    let proc = &thread.proc_data.proc;
+    let cpus_allowed = format_cpumask_hex(task.cpumask(), ax_hal::cpu_num());
+    let cpus_allowed_list = format_cpumask_list(task.cpumask(), ax_hal::cpu_num());
 
-fn render_task_status(
-    tgid: u32,
-    pid: u64,
-    cred: &crate::task::Cred,
-    cpumask: AxCpuMask,
-    cpu_num: usize,
-) -> String {
-    let cpus_allowed = format_cpumask_hex(cpumask, cpu_num);
-    let cpus_allowed_list = format_cpumask_list(cpumask, cpu_num);
-
-    render_task_status_fields(tgid, pid, cred, &cpus_allowed, &cpus_allowed_list)
+    render_task_status_fields(TaskStatusFields {
+        name: &task.name(),
+        tgid: proc.pid(),
+        pid: task.id().as_u64(),
+        ppid: proc.parent().map_or(0, |p| p.pid()),
+        pgid: proc.group().pgid(),
+        sid: proc.group().session().sid(),
+        thread_count: proc.threads().len(),
+        cred: &cred,
+        cpus_allowed: &cpus_allowed,
+        cpus_allowed_list: &cpus_allowed_list,
+    })
 }
 
 #[rustfmt::skip]
-fn render_task_status_fields(
-    tgid: u32,
-    pid: u64,
-    cred: &crate::task::Cred,
-    cpus_allowed: &str,
-    cpus_allowed_list: &str,
-) -> String {
+fn render_task_status_fields(fields: TaskStatusFields<'_>) -> String {
+    let TaskStatusFields {
+        name,
+        tgid,
+        pid,
+        ppid,
+        pgid,
+        sid,
+        thread_count,
+        cred,
+        cpus_allowed,
+        cpus_allowed_list,
+    } = fields;
+    let name = task_status_name(name);
     format!(
-        "Tgid:\t{tgid}\n\
+        "Name:\t{name}\n\
+        Umask:\t0022\n\
+        State:\tR (running)\n\
+        Tgid:\t{tgid}\n\
+        Ngid:\t0\n\
         Pid:\t{pid}\n\
+        PPid:\t{ppid}\n\
+        TracerPid:\t0\n\
         Uid:\t{}\t{}\t{}\t{}\n\
         Gid:\t{}\t{}\t{}\t{}\n\
+        FDSize:\t64\n\
+        Groups:\t{}\n\
+        NStgid:\t{tgid}\n\
+        NSpid:\t{pid}\n\
+        NSpgid:\t{pgid}\n\
+        NSsid:\t{sid}\n\
+        VmPeak:\t0 kB\n\
+        VmSize:\t0 kB\n\
+        VmRSS:\t0 kB\n\
+        Threads:\t{thread_count}\n\
+        SigQ:\t0/15430\n\
+        SigPnd:\t0000000000000000\n\
+        ShdPnd:\t0000000000000000\n\
+        SigBlk:\t0000000000000000\n\
+        SigIgn:\t0000000000000000\n\
+        SigCgt:\t0000000000000000\n\
+        CapInh:\t0000000000000000\n\
+        CapPrm:\t00000000ffffffff\n\
+        CapEff:\t00000000ffffffff\n\
+        CapBnd:\t00000000ffffffff\n\
+        CapAmb:\t0000000000000000\n\
+        NoNewPrivs:\t0\n\
+        Seccomp:\t0\n\
         Cpus_allowed:\t{cpus_allowed}\n\
         Cpus_allowed_list:\t{cpus_allowed_list}\n\
         Mems_allowed:\t1\n\
-        Mems_allowed_list:\t0",
+        Mems_allowed_list:\t0\n\
+        voluntary_ctxt_switches:\t0\n\
+        nonvoluntary_ctxt_switches:\t0\n",
         cred.uid, cred.euid, cred.suid, cred.fsuid,
         cred.gid, cred.egid, cred.sgid, cred.fsgid,
+        cred.gid,
     )
+}
+
+fn task_status_name(name: &str) -> &str {
+    if name.len() <= 15 {
+        return name;
+    }
+    let mut end = 15;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 fn format_cpumask_hex(cpumask: AxCpuMask, cpu_num: usize) -> String {
@@ -425,10 +494,7 @@ impl SimpleDirOps for ThreadDir {
                 let task = self.task.clone();
                 SeqFile::new_regular(fs, move || render_thread_maps(&task)).into()
             }
-            "mounts" => SimpleFile::new_regular(fs, move || {
-                Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
-            })
-            .into(),
+            "mounts" => SimpleFile::new_regular(fs, move || Ok(PROC_MOUNTS)).into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();
@@ -527,9 +593,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
         "mounts",
-        SimpleFile::new_regular(fs.clone(), || {
-            Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
-        }),
+        SimpleFile::new_regular(fs.clone(), || Ok(PROC_MOUNTS)),
     );
     root.add(
         "meminfo",
@@ -645,7 +709,7 @@ mod tests {
 
     use super::{
         collect_cpu_presence, format_cpu_presence_hex, format_cpu_presence_list,
-        render_task_status_fields,
+        render_task_status_fields, task_status_name,
     };
     use crate::task::Cred;
 
@@ -662,7 +726,18 @@ mod tests {
         let cpus_allowed = format_cpu_presence_hex(&cpu_presence);
         let cpus_allowed_list = format_cpu_presence_list(&cpu_presence);
 
-        render_task_status_fields(tgid, pid, &Cred::root(), &cpus_allowed, &cpus_allowed_list)
+        render_task_status_fields(TaskStatusFields {
+            name: "status-test",
+            tgid,
+            pid,
+            ppid: 1,
+            pgid: tgid,
+            sid: tgid,
+            thread_count: 1,
+            cred: &Cred::root(),
+            cpus_allowed: &cpus_allowed,
+            cpus_allowed_list: &cpus_allowed_list,
+        })
     }
 
     #[test]
@@ -704,5 +779,11 @@ mod tests {
         assert!(status.contains("Pid:\t84\n"));
         assert!(status.contains("Cpus_allowed:\t0000000a\n"));
         assert!(status.contains("Cpus_allowed_list:\t1,3\n"));
+    }
+
+    #[test]
+    fn task_status_name_truncates_on_utf8_boundary() {
+        assert_eq!(task_status_name("1234567890123456"), "123456789012345");
+        assert_eq!(task_status_name("12345678901234中"), "12345678901234");
     }
 }

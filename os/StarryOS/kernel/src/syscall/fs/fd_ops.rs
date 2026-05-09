@@ -68,7 +68,13 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     options
 }
 
-fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
+struct OpenedFile {
+    fd: i32,
+    path: alloc::string::String,
+    is_dir: bool,
+}
+
+fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<OpenedFile> {
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             // /dev/xx handling
@@ -113,7 +119,10 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like(f, flags & O_CLOEXEC != 0)
+    let path = f.path().into_owned();
+    let is_dir = f.downcast_ref::<Directory>().is_some();
+    let fd = add_file_like(f, flags & O_CLOEXEC != 0)?;
+    Ok(OpenedFile { fd, path, is_dir })
 }
 
 /// Open or create a file.
@@ -144,11 +153,13 @@ pub fn sys_openat(
     } else {
         None
     };
-    let fd = with_fs(dirfd, |fs| options.open(fs, path)).and_then(|it| add_to_fd(it, raw_flags))?;
+    let opened =
+        with_fs(dirfd, |fs| options.open(fs, path)).and_then(|it| add_to_fd(it, raw_flags))?;
     if let Some((parent, name)) = create_target {
         inotify::notify_child_event(&parent, &name, IN_CREATE, 0);
     }
-    Ok(fd as isize)
+    inotify::notify_opened(&opened.path, opened.is_dir);
+    Ok(opened.fd as isize)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.

@@ -305,6 +305,12 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
     }
 
     let watch_target = parent_watch_target(dirfd, &path);
+    let target_path = with_fs(dirfd, |fs| {
+        fs.resolve_no_follow(&path)
+            .and_then(|loc| loc.absolute_path())
+    })
+    .ok()
+    .map(|path| path.to_string());
     with_fs(dirfd, |fs| {
         if flags & AT_REMOVEDIR as usize != 0 {
             fs.remove_dir(path)?;
@@ -320,6 +326,9 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             IN_DELETE
         };
         inotify::notify_child_event(&parent, &name, mask, 0);
+    }
+    if let Some(path) = target_path {
+        inotify::notify_deleted(&path, flags & AT_REMOVEDIR as usize != 0);
     }
     Ok(0)
 }
@@ -471,6 +480,9 @@ pub fn sys_fchownat(
         mode: Some(mode),
         ..Default::default()
     })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(0)
 }
 
@@ -502,6 +514,9 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         mode: Some(NodePermission::from_bits_truncate(mode as u16)),
         ..Default::default()
     })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(0)
 }
 
@@ -513,14 +528,17 @@ fn update_times(
     flags: u32,
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(AxError::BadFileDescriptor)?
-        .update_metadata(MetadataUpdate {
-            atime,
-            mtime,
-            ..Default::default()
-        })?;
+        .ok_or(AxError::BadFileDescriptor)?;
+    loc.update_metadata(MetadataUpdate {
+        atime,
+        mtime,
+        ..Default::default()
+    })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(())
 }
 

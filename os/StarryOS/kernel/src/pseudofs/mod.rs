@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use ax_errno::LinuxResult;
 use ax_fs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{
-    DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry,
+    DirNodeOps, FileNodeOps, Filesystem, MetadataUpdate, NodePermission, WeakDirEntry,
     path::{Path, PathBuf},
 };
 pub use tmp::MemoryFs;
@@ -47,6 +47,8 @@ impl<T: FileNodeOps> From<Arc<T>> for NodeOpsMux {
 }
 
 const DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o755);
+const RUNTIME_DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o700);
+const STICKY_TMP_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o1777);
 
 fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
     if fs.resolve(path).is_err() {
@@ -57,6 +59,17 @@ fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()>
     Ok(())
 }
 
+fn ensure_dir(fs: &FsContext, path: &str, mode: NodePermission) -> LinuxResult<()> {
+    if fs.resolve(path).is_err() {
+        fs.create_dir(path, mode)?;
+    }
+    fs.resolve(path)?.update_metadata(MetadataUpdate {
+        mode: Some(mode),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
 /// Mount all filesystems
 pub fn mount_all() -> LinuxResult<()> {
     info!("Initialize pseudofs...");
@@ -64,7 +77,13 @@ pub fn mount_all() -> LinuxResult<()> {
     let fs = FS_CONTEXT.lock();
     mount_at(&fs, "/dev", dev::new_devfs())?;
     mount_at(&fs, "/dev/shm", tmp::MemoryFs::new())?;
+    ensure_dir(&fs, "/dev/shm", STICKY_TMP_PERMISSION)?;
     mount_at(&fs, "/tmp", tmp::MemoryFs::new())?;
+    ensure_dir(&fs, "/tmp", STICKY_TMP_PERMISSION)?;
+    mount_at(&fs, "/run", tmp::MemoryFs::new())?;
+    ensure_dir(&fs, "/run", DIR_PERMISSION)?;
+    ensure_dir(&fs, "/run/user", DIR_PERMISSION)?;
+    ensure_dir(&fs, "/run/user/0", RUNTIME_DIR_PERMISSION)?;
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", tmp::MemoryFs::new())?;

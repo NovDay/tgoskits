@@ -119,6 +119,12 @@ impl File {
     fn is_blocking(&self) -> bool {
         self.inner.location().flags().contains(NodeFlags::BLOCKING)
     }
+
+    fn was_opened_writable(&self) -> bool {
+        self.inner
+            .flags()
+            .intersects(FileFlags::WRITE | FileFlags::APPEND)
+    }
 }
 
 fn path_for(loc: &Location) -> Cow<'static, str> {
@@ -205,6 +211,12 @@ impl Pollable for File {
     }
 }
 
+impl Drop for File {
+    fn drop(&mut self) {
+        super::inotify::notify_closed(&self.path(), self.was_opened_writable(), false);
+    }
+}
+
 /// Directory wrapper for `ax_fs::fops::Directory`.
 pub struct Directory {
     inner: Location,
@@ -222,6 +234,12 @@ impl Directory {
     /// Get the inner node of the directory.
     pub fn inner(&self) -> &Location {
         &self.inner
+    }
+}
+
+impl Drop for Directory {
+    fn drop(&mut self) {
+        super::inotify::notify_closed(&self.path(), false, true);
     }
 }
 
