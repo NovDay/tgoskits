@@ -1,7 +1,10 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use ax_errno::{AxError, AxResult};
-use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
+use linux_raw_sys::{
+    ctypes::c_long,
+    net::{SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, ucred},
+};
 
 use crate::{
     file::{FileLike, get_file_like},
@@ -10,7 +13,19 @@ use crate::{
 
 pub enum CMsg {
     Rights { fds: Vec<Arc<dyn FileLike>> },
+    Credentials,
 }
+
+pub fn cmsg_align(len: usize) -> usize {
+    let align = size_of::<c_long>();
+    (len + align - 1) & !(align - 1)
+}
+
+fn cmsg_align_down(len: usize) -> usize {
+    let align = size_of::<c_long>();
+    len & !(align - 1)
+}
+
 impl CMsg {
     pub fn parse(hdr: &cmsghdr) -> AxResult<Self> {
         if hdr.cmsg_len < size_of::<cmsghdr>() {
@@ -35,6 +50,12 @@ impl CMsg {
                     fds.push(f);
                 }
                 Self::Rights { fds }
+            }
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                if data.len() < size_of::<ucred>() {
+                    return Err(AxError::InvalidInput);
+                }
+                Self::Credentials
             }
             _ => {
                 return Err(AxError::InvalidInput);
@@ -65,7 +86,10 @@ impl<'a> CMsgBuilder<'a> {
         ty: u32,
         body: impl FnOnce(&mut [u8]) -> AxResult<usize>,
     ) -> AxResult<bool> {
-        let Some(body_capacity) = (self.capacity - *self.len).checked_sub(size_of::<cmsghdr>())
+        let Some(available) = self.capacity.checked_sub(*self.len) else {
+            return Ok(false);
+        };
+        let Some(body_capacity) = cmsg_align_down(available).checked_sub(size_of::<cmsghdr>())
         else {
             return Ok(false);
         };
@@ -79,9 +103,13 @@ impl<'a> CMsgBuilder<'a> {
         let body_len = body(data)?;
 
         let cmsg_len = size_of::<cmsghdr>() + body_len;
+        let aligned_len = cmsg_align(cmsg_len);
+        if aligned_len > available {
+            return Ok(false);
+        }
         hdr.cmsg_len = cmsg_len;
-        self.hdr = UserPtr::from(hdr as *const _ as usize + cmsg_len);
-        *self.len += cmsg_len;
+        self.hdr = UserPtr::from(hdr as *const _ as usize + aligned_len);
+        *self.len += aligned_len;
         Ok(true)
     }
 }

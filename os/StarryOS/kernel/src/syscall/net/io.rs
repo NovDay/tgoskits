@@ -4,11 +4,15 @@ use core::{net::Ipv4Addr, time::Duration};
 use ax_errno::{AxError, AxResult};
 use ax_hal::time::wall_time;
 use ax_io::prelude::*;
-use axnet::{CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, SocketAddrEx, SocketOps};
+use axnet::{
+    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, SocketAddrEx, SocketOps,
+    options::UnixCredentials,
+};
 use linux_raw_sys::{
     general::timespec,
     net::{
-        MSG_PEEK, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        MSG_PEEK, MSG_TRUNC, SCM_CREDENTIALS, SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr,
+        sockaddr, socklen_t,
     },
 };
 
@@ -16,7 +20,7 @@ use super::addr::SocketAddrExt;
 use crate::{
     file::{FileLike, Socket, add_file_like},
     mm::{IoVec, IoVectorBuf, UserConstPtr, UserPtr, VmBytes, VmBytesMut},
-    syscall::net::{CMsg, CMsgBuilder},
+    syscall::net::{CMsg, CMsgBuilder, cmsg_align},
     time::TimeValueLike,
 };
 
@@ -52,7 +56,9 @@ fn parse_send_cmsgs(control_ptr: usize, control_len: usize) -> AxResult<Vec<CMsg
         }
 
         cmsg.push(Box::new(CMsg::parse(hdr)?) as CMsgData);
-        ptr += hdr.cmsg_len;
+        ptr = ptr
+            .checked_add(cmsg_align(hdr.cmsg_len))
+            .ok_or(AxError::InvalidInput)?;
     }
 
     Ok(cmsg)
@@ -75,6 +81,7 @@ fn send_impl(
     debug!("sys_send <= fd: {fd}, flags: {flags}, addr: {addr:?}");
 
     let socket = Socket::from_fd(fd)?;
+    socket.update_current_credentials();
     let sent = socket.send(
         &mut src,
         SendOptions {
@@ -149,21 +156,29 @@ fn recv_impl(
 
     if let Some(mut builder) = cmsg_builder {
         for cmsg in cmsg {
-            let Ok(cmsg) = cmsg.downcast::<CMsg>() else {
-                warn!("received unexpected cmsg");
-                continue;
-            };
-
-            let pushed = match *cmsg {
-                CMsg::Rights { fds } => builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
-                    let mut written = 0;
-                    for (f, chunk) in fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>())) {
-                        let fd = add_file_like(f, false)?;
-                        chunk.copy_from_slice(&fd.to_ne_bytes());
-                        written += size_of::<i32>();
+            let pushed = match cmsg.downcast::<CMsg>() {
+                Ok(cmsg) => match *cmsg {
+                    CMsg::Rights { fds } => builder.push(SOL_SOCKET, SCM_RIGHTS, |data| {
+                        let mut written = 0;
+                        for (f, chunk) in
+                            fds.into_iter().zip(data.chunks_exact_mut(size_of::<i32>()))
+                        {
+                            let fd = add_file_like(f, false)?;
+                            chunk.copy_from_slice(&fd.to_ne_bytes());
+                            written += size_of::<i32>();
+                        }
+                        Ok(written)
+                    })?,
+                    CMsg::Credentials => continue,
+                },
+                Err(cmsg) => match cmsg.downcast::<UnixCredentials>() {
+                    Ok(cred) => builder
+                        .push(SOL_SOCKET, SCM_CREDENTIALS, |data| write_ucred(data, *cred))?,
+                    Err(_) => {
+                        warn!("received unexpected cmsg");
+                        continue;
                     }
-                    Ok(written)
-                })?,
+                },
             };
             if !pushed {
                 break;
@@ -173,6 +188,22 @@ fn recv_impl(
 
     debug!("sys_recv => fd: {fd}, recv: {recv}");
     Ok(recv as isize)
+}
+
+fn write_ucred(data: &mut [u8], cred: UnixCredentials) -> AxResult<usize> {
+    if data.len() < size_of::<linux_raw_sys::net::ucred>() {
+        return Ok(0);
+    }
+    let sys_cred = linux_raw_sys::net::ucred {
+        pid: cred.pid,
+        uid: cred.uid,
+        gid: cred.gid,
+    };
+    let src = &sys_cred as *const _ as *const u8;
+    data[..size_of::<linux_raw_sys::net::ucred>()].copy_from_slice(unsafe {
+        core::slice::from_raw_parts(src, size_of::<linux_raw_sys::net::ucred>())
+    });
+    Ok(size_of::<linux_raw_sys::net::ucred>())
 }
 
 pub fn sys_recvfrom(

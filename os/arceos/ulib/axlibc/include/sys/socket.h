@@ -43,6 +43,12 @@ struct cmsghdr {
     int cmsg_type;
 };
 
+struct ucred {
+    unsigned pid;
+    unsigned uid;
+    unsigned gid;
+};
+
 struct sockaddr {
     sa_family_t sa_family;
     char sa_data[14];
@@ -114,6 +120,9 @@ int getpeername(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict 
 #define SO_DETACH_REUSEPORT_BPF    68
 #define SO_PREFER_BUSY_POLL        69
 #define SO_BUSY_POLL_BUDGET        70
+
+#define SCM_RIGHTS      1
+#define SCM_CREDENTIALS 2
 
 #define MSG_NOSIGNAL 0x4000
 

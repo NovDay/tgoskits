@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::task::Context;
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    task::Context,
+};
 
 use async_channel::TryRecvError;
 use async_trait::async_trait;
@@ -20,6 +23,7 @@ struct Packet {
     data: Vec<u8>,
     cmsg: Vec<CMsgData>,
     sender: UnixSocketAddr,
+    sender_credentials: UnixCredentials,
 }
 
 struct Channel {
@@ -48,6 +52,8 @@ pub struct DgramTransport {
     local_addr: RwLock<UnixSocketAddr>,
     poll_state: Arc<PollSet>,
     general: GeneralOptions,
+    pass_credentials: AtomicBool,
+    current_credentials: Mutex<UnixCredentials>,
     pid: u32,
 }
 impl DgramTransport {
@@ -59,6 +65,8 @@ impl DgramTransport {
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
             poll_state: Arc::default(),
             general: GeneralOptions::default(),
+            pass_credentials: AtomicBool::new(false),
+            current_credentials: Mutex::new(UnixCredentials::new(pid)),
             pid,
         }
     }
@@ -74,6 +82,8 @@ impl DgramTransport {
             local_addr: RwLock::new(UnixSocketAddr::Unnamed),
             poll_state: Arc::default(),
             general: GeneralOptions::default(),
+            pass_credentials: AtomicBool::new(false),
+            current_credentials: Mutex::new(UnixCredentials::new(pid)),
             pid,
         }
     }
@@ -113,12 +123,17 @@ impl Configurable for DgramTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                **enabled = self.pass_credentials.load(Ordering::Relaxed);
+            }
             O::PeerCredentials(cred) => {
                 // Datagram sockets are stateless and do not have a peer, so we
                 // return the credentials of the process that created the
                 // socket.
                 **cred = UnixCredentials::new(self.pid);
+            }
+            O::CurrentCredentials(cred) => {
+                **cred = self.current_credentials.lock().clone();
             }
             _ => return Ok(false),
         }
@@ -133,7 +148,12 @@ impl Configurable for DgramTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                self.pass_credentials.store(*enabled, Ordering::Relaxed);
+            }
+            O::CurrentCredentials(cred) => {
+                *self.current_credentials.lock() = cred.clone();
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -190,6 +210,7 @@ impl TransportOps for DgramTransport {
             data: message,
             cmsg: options.cmsg,
             sender: self.local_addr.read().clone(),
+            sender_credentials: self.current_credentials.lock().clone(),
         };
 
         let connected = self.connected.read();
@@ -224,7 +245,12 @@ impl TransportOps for DgramTransport {
                 return Err(AxError::NotConnected);
             };
 
-            let Packet { data, cmsg, sender } = match rx.try_recv() {
+            let Packet {
+                data,
+                cmsg,
+                sender,
+                sender_credentials,
+            } = match rx.try_recv() {
                 Ok(packet) => packet,
                 Err(TryRecvError::Empty) => {
                     return Err(AxError::WouldBlock);
@@ -243,6 +269,9 @@ impl TransportOps for DgramTransport {
             }
             if let Some(dst) = options.cmsg.as_mut() {
                 dst.extend(cmsg);
+                if self.pass_credentials.load(Ordering::Relaxed) {
+                    dst.push(Box::new(sender_credentials));
+                }
             }
 
             Ok(if options.flags.contains(RecvFlags::TRUNCATE) {

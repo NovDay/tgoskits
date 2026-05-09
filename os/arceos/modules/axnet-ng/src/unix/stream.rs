@@ -68,6 +68,7 @@ struct StreamMeta {
     write_seq: usize,
     read_seq: usize,
     ancillary: VecDeque<AncillaryRecord>,
+    credentials: VecDeque<CredentialRecord>,
 }
 
 struct AncillaryRecord {
@@ -75,9 +76,23 @@ struct AncillaryRecord {
     cmsg: Vec<CMsgData>,
 }
 
+struct CredentialRecord {
+    end_seq: usize,
+    credentials: UnixCredentials,
+}
+
 impl StreamMeta {
-    fn note_write(&mut self, count: usize, cmsg: Option<Vec<CMsgData>>) {
+    fn note_write(
+        &mut self,
+        count: usize,
+        cmsg: Option<Vec<CMsgData>>,
+        credentials: UnixCredentials,
+    ) {
         self.write_seq = self.write_seq.saturating_add(count);
+        self.credentials.push_back(CredentialRecord {
+            end_seq: self.write_seq,
+            credentials,
+        });
         if let Some(cmsg) = cmsg
             && !cmsg.is_empty()
         {
@@ -94,7 +109,38 @@ impl StreamMeta {
             .map(|record| record.end_seq.saturating_sub(self.read_seq))
     }
 
-    fn note_read(&mut self, count: usize, mut cmsg_dst: Option<&mut Vec<CMsgData>>) {
+    fn bytes_until_credentials(&mut self) -> Option<usize> {
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= self.read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        self.credentials
+            .front()
+            .map(|record| record.end_seq.saturating_sub(self.read_seq))
+    }
+
+    fn note_read(
+        &mut self,
+        count: usize,
+        mut cmsg_dst: Option<&mut Vec<CMsgData>>,
+    ) -> Option<UnixCredentials> {
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= self.read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        let credentials = self
+            .credentials
+            .front()
+            .map(|record| record.credentials.clone());
+
         self.read_seq = self.read_seq.saturating_add(count);
         let read_seq = self.read_seq;
         while self
@@ -107,6 +153,15 @@ impl StreamMeta {
                 dst.extend(record.cmsg);
             }
         }
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        credentials
     }
 }
 
@@ -145,6 +200,8 @@ pub struct StreamTransport {
     conn_rx: Mutex<Option<(async_channel::Receiver<ConnRequest>, Arc<PollSet>)>>,
     poll_state: PollSet,
     general: GeneralOptions,
+    pass_credentials: AtomicBool,
+    current_credentials: Mutex<UnixCredentials>,
     pid: u32,
     rx_closed: AtomicBool,
     tx_closed: AtomicBool,
@@ -161,6 +218,8 @@ impl StreamTransport {
             conn_rx: Mutex::new(None),
             poll_state: PollSet::new(),
             general: GeneralOptions::default(),
+            pass_credentials: AtomicBool::new(false),
+            current_credentials: Mutex::new(UnixCredentials::new(pid)),
             pid,
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
@@ -188,7 +247,9 @@ impl Configurable for StreamTransport {
             O::SendBuffer(size) => {
                 **size = BUF_SIZE;
             }
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                **enabled = self.pass_credentials.load(Ordering::Relaxed);
+            }
             O::PeerCredentials(cred) => {
                 let peer_pid = self
                     .channel
@@ -196,6 +257,9 @@ impl Configurable for StreamTransport {
                     .as_ref()
                     .map_or(self.pid, |chan| chan.peer_pid);
                 **cred = UnixCredentials::new(peer_pid);
+            }
+            O::CurrentCredentials(cred) => {
+                **cred = self.current_credentials.lock().clone();
             }
             _ => return Ok(false),
         }
@@ -210,7 +274,12 @@ impl Configurable for StreamTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                self.pass_credentials.store(*enabled, Ordering::Relaxed);
+            }
+            O::CurrentCredentials(cred) => {
+                *self.current_credentials.lock() = cred.clone();
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -298,7 +367,11 @@ impl TransportOps for StreamTransport {
             };
             total += count;
             if count > 0 {
-                chan.tx_meta.lock().note_write(count, cmsg.take());
+                chan.tx_meta.lock().note_write(
+                    count,
+                    cmsg.take(),
+                    self.current_credentials.lock().clone(),
+                );
                 chan.poll_update.wake();
             }
 
@@ -318,9 +391,17 @@ impl TransportOps for StreamTransport {
             };
 
             let count = {
-                let ancillary_limit = chan.rx_meta.lock().bytes_until_ancillary();
+                let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                let read_limit = {
+                    let mut meta = chan.rx_meta.lock();
+                    let ancillary_limit = meta.bytes_until_ancillary();
+                    let credential_limit = pass_credentials
+                        .then(|| meta.bytes_until_credentials())
+                        .flatten();
+                    ancillary_limit.into_iter().chain(credential_limit).min()
+                };
                 let (left, right) = chan.rx.as_slices();
-                let limit = ancillary_limit.unwrap_or(usize::MAX);
+                let limit = read_limit.unwrap_or(usize::MAX);
                 let left_len = left.len().min(limit);
                 let mut count = dst.write(&left[..left_len])?;
                 if count >= left_len && count < limit {
@@ -331,9 +412,18 @@ impl TransportOps for StreamTransport {
                 count
             };
             if count > 0 {
-                chan.rx_meta
-                    .lock()
-                    .note_read(count, options.cmsg.as_deref_mut());
+                let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                let received_credentials = {
+                    let mut meta = chan.rx_meta.lock();
+                    let credentials = meta.note_read(count, options.cmsg.as_deref_mut());
+                    pass_credentials.then_some(credentials).flatten()
+                };
+                if pass_credentials
+                    && let Some(cmsg) = options.cmsg.as_deref_mut()
+                    && let Some(credentials) = received_credentials
+                {
+                    cmsg.push(Box::new(credentials));
+                }
                 chan.poll_update.wake();
                 Ok(count)
             } else if !chan.rx.write_is_held() {

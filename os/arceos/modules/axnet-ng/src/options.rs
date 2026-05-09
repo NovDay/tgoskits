@@ -63,6 +63,7 @@ define_options! {
     SendBufferForce(usize),
     PassCredentials(bool),
     PeerCredentials(UnixCredentials),
+    CurrentCredentials(UnixCredentials),
 
     // --- TCP level options (TCP_*) ----
     NoDelay(bool),

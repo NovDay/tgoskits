@@ -4,13 +4,16 @@ use core::{ffi::c_int, ops::Deref, task::Context};
 use ax_errno::{AxError, AxResult};
 use axnet::{
     RecvOptions, SendOptions, Socket as SocketInner, SocketOps,
-    options::{Configurable, GetSocketOption, SetSocketOption},
+    options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
 };
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{O_RDWR, S_IFSOCK};
 
 use super::{FileLike, Kstat};
-use crate::file::{IoDst, IoSrc, get_file_like};
+use crate::{
+    file::{IoDst, IoSrc, get_file_like},
+    task::AsThread,
+};
 
 pub struct Socket(pub SocketInner);
 
@@ -22,12 +25,29 @@ impl Deref for Socket {
     }
 }
 
+impl Socket {
+    pub fn update_current_credentials(&self) {
+        let current = ax_task::current();
+        let current = current.as_thread();
+        let cred = current.cred();
+        let current_cred = UnixCredentials {
+            pid: current.proc_data.proc.pid(),
+            uid: cred.euid,
+            gid: cred.egid,
+        };
+        let _ = self
+            .0
+            .set_option(SetSocketOption::CurrentCredentials(&current_cred));
+    }
+}
+
 impl FileLike for Socket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.recv(dst, RecvOptions::default())
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        self.update_current_credentials();
         self.send(src, SendOptions::default())
     }
 
