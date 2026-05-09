@@ -6,6 +6,7 @@ mod dir;
 mod file;
 mod fs;
 mod proc;
+mod sys;
 mod tmp;
 
 use alloc::sync::Arc;
@@ -14,7 +15,6 @@ use ax_errno::LinuxResult;
 use ax_fs::{FS_CONTEXT, FsContext};
 use axfs_ng_vfs::{
     DirNodeOps, FileNodeOps, Filesystem, MetadataUpdate, NodePermission, WeakDirEntry,
-    path::{Path, PathBuf},
 };
 pub use tmp::MemoryFs;
 
@@ -87,16 +87,8 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", tmp::MemoryFs::new())?;
-    let mut path = PathBuf::new();
-    for comp in Path::new("/sys/class/graphics/fb0/device").components() {
-        path.push(comp.as_str());
-        if fs.resolve(&path).is_err() {
-            fs.create_dir(&path, DIR_PERMISSION)?;
-        }
-    }
-    path.push("subsystem");
-    fs.symlink("whatever", &path)?;
     drop(fs);
+    sys::populate_sysfs()?;
 
     #[cfg(feature = "dev-log")]
     dev::bind_dev_log().expect("Failed to bind /dev/log");

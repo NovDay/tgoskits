@@ -30,6 +30,8 @@ test_commands = [
   "/usr/bin/inotify-smoke",
   "/usr/bin/fd-ipc-smoke",
   "/usr/bin/runtime-smoke",
+  "/usr/bin/sysfs-smoke",
+  "/usr/bin/udev-input-smoke",
   "/usr/bin/glib-smoke",
   "/usr/bin/dbus-smoke",
   "/usr/bin/gtk-smoke",

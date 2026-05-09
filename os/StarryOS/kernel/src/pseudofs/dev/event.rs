@@ -22,6 +22,9 @@ use crate::{
     pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
 };
 const KEY_CNT: usize = EventType::Key.bits_count();
+const INPUT_MAJOR: u32 = 13;
+const INPUT_MICE_MINOR: u32 = 63;
+const INPUT_EVENT_MINOR_BASE: u32 = 64;
 
 struct Inner {
     device: AxInputDevice,
@@ -337,16 +340,25 @@ pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
         const BTN_MOUSE: usize = 0x110;
         let is_mouse = has_keys && keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0;
 
+        let ops = Arc::new(EventDev::new(device));
         let dev = Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(13, (input_id + 1) as _),
-            Arc::new(EventDev::new(device)),
+            DeviceId::new(INPUT_MAJOR, INPUT_EVENT_MINOR_BASE + input_id as u32),
+            ops.clone(),
         );
 
         inputs.add(format!("event{input_id}"), dev.clone());
         if is_mouse && !has_mice {
-            inputs.add("mice", dev);
+            inputs.add(
+                "mice",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(INPUT_MAJOR, INPUT_MICE_MINOR),
+                    ops,
+                ),
+            );
             has_mice = true;
         }
     }
