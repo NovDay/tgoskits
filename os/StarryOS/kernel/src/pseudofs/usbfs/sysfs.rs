@@ -7,7 +7,7 @@ use super::{
     irq,
     manager::UsbFsManager,
 };
-use crate::pseudofs::{NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs};
+use crate::pseudofs::{NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs, sys};
 
 const SYSFS_MAGIC: u32 = 0x6265_6572;
 
@@ -32,11 +32,28 @@ fn text_file(fs: Arc<SimpleFs>, text: impl Into<Vec<u8>>) -> NodeOpsMux {
     SimpleFile::new_regular(fs, move || -> VfsResult<Vec<u8>> { Ok(text.clone()) }).into()
 }
 
-fn symlink(fs: Arc<SimpleFs>, target: &'static str) -> NodeOpsMux {
+fn symlink(fs: Arc<SimpleFs>, target: impl Into<Vec<u8>>) -> NodeOpsMux {
+    let target = target.into();
     SimpleFile::new(fs, NodeType::Symlink, move || -> VfsResult<Vec<u8>> {
-        Ok(target.as_bytes().to_vec())
+        Ok(target.clone())
     })
     .into()
+}
+
+fn class_device_target(device: &sys::SysfsDevice) -> String {
+    format!("../../../devices/virtual/{}/{}", device.class, device.name)
+}
+
+fn dev_char_target(device: &sys::SysfsDevice) -> String {
+    format!("../../devices/virtual/{}/{}", device.class, device.name)
+}
+
+fn uevent(device: &sys::SysfsDevice) -> Vec<u8> {
+    format!(
+        "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+        device.major, device.minor, device.devname
+    )
+    .into_bytes()
 }
 
 struct SysRootDir {
@@ -46,7 +63,11 @@ struct SysRootDir {
 
 impl SimpleDirOps for SysRootDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(["bus", "class"].into_iter().map(Cow::Borrowed))
+        Box::new(
+            ["bus", "class", "devices", "dev"]
+                .into_iter()
+                .map(Cow::Borrowed),
+        )
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -64,6 +85,18 @@ impl SimpleDirOps for SysRootDir {
                     fs: self.fs.clone(),
                 },
             )),
+            "devices" => Ok(dir(
+                self.fs.clone(),
+                SysDevicesDir {
+                    fs: self.fs.clone(),
+                },
+            )),
+            "dev" => Ok(dir(
+                self.fs.clone(),
+                SysDevDir {
+                    fs: self.fs.clone(),
+                },
+            )),
             _ => Err(ax_errno::AxError::NotFound),
         }
     }
@@ -75,7 +108,14 @@ struct SysClassDir {
 
 impl SimpleDirOps for SysClassDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(["graphics"].into_iter().map(Cow::Borrowed))
+        let mut names = Vec::new();
+        if sys::framebuffer_device().is_some() {
+            names.push(Cow::Borrowed("graphics"));
+        }
+        if !sys::input_devices().is_empty() {
+            names.push(Cow::Borrowed("input"));
+        }
+        Box::new(names.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
@@ -83,6 +123,12 @@ impl SimpleDirOps for SysClassDir {
             "graphics" => Ok(dir(
                 self.fs.clone(),
                 SysGraphicsDir {
+                    fs: self.fs.clone(),
+                },
+            )),
+            "input" => Ok(dir(
+                self.fs.clone(),
+                SysInputDir {
                     fs: self.fs.clone(),
                 },
             )),
@@ -97,14 +143,108 @@ struct SysGraphicsDir {
 
 impl SimpleDirOps for SysGraphicsDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(["fb0"].into_iter().map(Cow::Borrowed))
+        Box::new(
+            sys::framebuffer_device()
+                .into_iter()
+                .map(|device| Cow::Owned(device.name)),
+        )
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let Some(device) = sys::framebuffer_device().filter(|device| device.name == name) else {
+            return Err(ax_errno::AxError::NotFound);
+        };
+        Ok(dir(
+            self.fs.clone(),
+            SysClassDeviceDir {
+                fs: self.fs.clone(),
+                device,
+            },
+        ))
+    }
+}
+
+struct SysInputDir {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for SysInputDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(
+            sys::input_devices()
+                .into_iter()
+                .map(|device| Cow::Owned(device.name)),
+        )
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let device = sys::input_devices()
+            .into_iter()
+            .find(|device| device.name == name)
+            .ok_or(ax_errno::AxError::NotFound)?;
+        Ok(dir(
+            self.fs.clone(),
+            SysClassDeviceDir {
+                fs: self.fs.clone(),
+                device,
+            },
+        ))
+    }
+}
+
+struct SysClassDeviceDir {
+    fs: Arc<SimpleFs>,
+    device: sys::SysfsDevice,
+}
+
+impl SimpleDirOps for SysClassDeviceDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(
+            ["dev", "name", "uevent", "device", "subsystem"]
+                .into_iter()
+                .map(Cow::Borrowed),
+        )
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         match name {
-            "fb0" => Ok(dir(
+            "dev" => Ok(text_file(
                 self.fs.clone(),
-                SysFb0Dir {
+                format!("{}:{}\n", self.device.major, self.device.minor),
+            )),
+            "name" => Ok(text_file(
+                self.fs.clone(),
+                format!("{}\n", self.device.name),
+            )),
+            "uevent" => Ok(text_file(self.fs.clone(), uevent(&self.device))),
+            "device" => Ok(symlink(self.fs.clone(), class_device_target(&self.device))),
+            "subsystem" => Ok(symlink(
+                self.fs.clone(),
+                match self.device.class {
+                    "graphics" => "../../../class/graphics",
+                    "input" => "../../../class/input",
+                    _ => "../../../class",
+                },
+            )),
+            _ => Err(ax_errno::AxError::NotFound),
+        }
+    }
+}
+
+struct SysDevicesDir {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for SysDevicesDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(["virtual"].into_iter().map(Cow::Borrowed))
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        match name {
+            "virtual" => Ok(dir(
+                self.fs.clone(),
+                SysVirtualDir {
                     fs: self.fs.clone(),
                 },
             )),
@@ -113,20 +253,125 @@ impl SimpleDirOps for SysGraphicsDir {
     }
 }
 
-struct SysFb0Dir {
+struct SysVirtualDir {
     fs: Arc<SimpleFs>,
 }
 
-impl SimpleDirOps for SysFb0Dir {
+impl SimpleDirOps for SysVirtualDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(["device"].into_iter().map(Cow::Borrowed))
+        let mut names = Vec::new();
+        if sys::framebuffer_device().is_some() {
+            names.push(Cow::Borrowed("graphics"));
+        }
+        if !sys::input_devices().is_empty() {
+            names.push(Cow::Borrowed("input"));
+        }
+        Box::new(names.into_iter())
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
         match name {
-            "device" => Ok(dir(
+            "graphics" => Ok(dir(
                 self.fs.clone(),
-                SysFb0DeviceDir {
+                SysVirtualClassDir {
+                    fs: self.fs.clone(),
+                    class: "graphics",
+                },
+            )),
+            "input" => Ok(dir(
+                self.fs.clone(),
+                SysVirtualClassDir {
+                    fs: self.fs.clone(),
+                    class: "input",
+                },
+            )),
+            _ => Err(ax_errno::AxError::NotFound),
+        }
+    }
+}
+
+struct SysVirtualClassDir {
+    fs: Arc<SimpleFs>,
+    class: &'static str,
+}
+
+impl SimpleDirOps for SysVirtualClassDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(
+            sys::virtual_devices()
+                .into_iter()
+                .filter(move |device| device.class == self.class)
+                .map(|device| Cow::Owned(device.name)),
+        )
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        let device = sys::virtual_devices()
+            .into_iter()
+            .find(|device| device.class == self.class && device.name == name)
+            .ok_or(ax_errno::AxError::NotFound)?;
+        Ok(dir(
+            self.fs.clone(),
+            SysVirtualDeviceDir {
+                fs: self.fs.clone(),
+                device,
+            },
+        ))
+    }
+}
+
+struct SysVirtualDeviceDir {
+    fs: Arc<SimpleFs>,
+    device: sys::SysfsDevice,
+}
+
+impl SimpleDirOps for SysVirtualDeviceDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(
+            ["dev", "name", "uevent", "subsystem"]
+                .into_iter()
+                .map(Cow::Borrowed),
+        )
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        match name {
+            "dev" => Ok(text_file(
+                self.fs.clone(),
+                format!("{}:{}\n", self.device.major, self.device.minor),
+            )),
+            "name" => Ok(text_file(
+                self.fs.clone(),
+                format!("{}\n", self.device.name),
+            )),
+            "uevent" => Ok(text_file(self.fs.clone(), uevent(&self.device))),
+            "subsystem" => Ok(symlink(
+                self.fs.clone(),
+                match self.device.class {
+                    "graphics" => "../../../../class/graphics",
+                    "input" => "../../../../class/input",
+                    _ => "../../../../class",
+                },
+            )),
+            _ => Err(ax_errno::AxError::NotFound),
+        }
+    }
+}
+
+struct SysDevDir {
+    fs: Arc<SimpleFs>,
+}
+
+impl SimpleDirOps for SysDevDir {
+    fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
+        Box::new(["char"].into_iter().map(Cow::Borrowed))
+    }
+
+    fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
+        match name {
+            "char" => Ok(dir(
+                self.fs.clone(),
+                SysDevCharDir {
                     fs: self.fs.clone(),
                 },
             )),
@@ -135,20 +380,25 @@ impl SimpleDirOps for SysFb0Dir {
     }
 }
 
-struct SysFb0DeviceDir {
+struct SysDevCharDir {
     fs: Arc<SimpleFs>,
 }
 
-impl SimpleDirOps for SysFb0DeviceDir {
+impl SimpleDirOps for SysDevCharDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
-        Box::new(["subsystem"].into_iter().map(Cow::Borrowed))
+        Box::new(
+            sys::virtual_devices()
+                .into_iter()
+                .map(|device| Cow::Owned(format!("{}:{}", device.major, device.minor))),
+        )
     }
 
     fn lookup_child(&self, name: &str) -> VfsResult<NodeOpsMux> {
-        match name {
-            "subsystem" => Ok(symlink(self.fs.clone(), "whatever")),
-            _ => Err(ax_errno::AxError::NotFound),
-        }
+        let device = sys::virtual_devices()
+            .into_iter()
+            .find(|device| format!("{}:{}", device.major, device.minor) == name)
+            .ok_or(ax_errno::AxError::NotFound)?;
+        Ok(symlink(self.fs.clone(), dev_char_target(&device)))
     }
 }
 

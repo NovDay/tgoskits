@@ -1,6 +1,7 @@
 pub mod epoll;
 pub mod event;
 mod fs;
+pub mod inotify;
 mod net;
 pub mod netlink;
 mod pidfd;
@@ -236,6 +237,14 @@ pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
     Ok(table.add(fd).map_err(|_| AxError::TooManyOpenFiles)? as c_int)
 }
 
+pub(crate) fn notify_file_descriptor_closed(f: &FileDescriptor) {
+    if let Some(file) = f.inner.downcast_ref::<File>() {
+        inotify::notify_closed(&file.path(), file.was_opened_writable(), false);
+    } else if let Some(dir) = f.inner.downcast_ref::<Directory>() {
+        inotify::notify_closed(&dir.path(), false, true);
+    }
+}
+
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
     let f = FD_TABLE
@@ -243,6 +252,7 @@ pub fn close_file_like(fd: c_int) -> AxResult {
         .remove(fd as usize)
         .ok_or(AxError::BadFileDescriptor)?;
     debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+    notify_file_descriptor_closed(&f);
     Ok(())
 }
 
@@ -272,6 +282,9 @@ pub fn close_all_fds() {
 
     // Drop removed descriptors after releasing FD_TABLE lock to avoid
     // lock re-entry or side effects from destructor paths.
+    for fd in &removed {
+        notify_file_descriptor_closed(fd);
+    }
     drop(removed);
 }
 

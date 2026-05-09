@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
@@ -15,7 +15,7 @@ use ringbuf::{
 };
 
 use crate::{
-    RecvOptions, SendOptions, Shutdown,
+    CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown,
     general::GeneralOptions,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     unix::{Transport, TransportOps, UnixSocketAddr},
@@ -31,16 +31,22 @@ fn new_channels(pid: u32) -> (Channel, Channel) {
     let (client_tx, server_rx) = new_uni_channel();
     let (server_tx, client_rx) = new_uni_channel();
     let poll_update = Arc::new(PollSet::new());
+    let client_to_server_meta = Arc::new(Mutex::new(StreamMeta::default()));
+    let server_to_client_meta = Arc::new(Mutex::new(StreamMeta::default()));
     (
         Channel {
             tx: client_tx,
             rx: client_rx,
+            tx_meta: client_to_server_meta.clone(),
+            rx_meta: server_to_client_meta.clone(),
             poll_update: poll_update.clone(),
             peer_pid: pid,
         },
         Channel {
             tx: server_tx,
             rx: server_rx,
+            tx_meta: server_to_client_meta,
+            rx_meta: client_to_server_meta,
             poll_update,
             peer_pid: pid,
         },
@@ -50,9 +56,113 @@ fn new_channels(pid: u32) -> (Channel, Channel) {
 struct Channel {
     tx: HeapProd<u8>,
     rx: HeapCons<u8>,
+    tx_meta: Arc<Mutex<StreamMeta>>,
+    rx_meta: Arc<Mutex<StreamMeta>>,
     // TODO: granularity
     poll_update: Arc<PollSet>,
     peer_pid: u32,
+}
+
+#[derive(Default)]
+struct StreamMeta {
+    write_seq: usize,
+    read_seq: usize,
+    ancillary: VecDeque<AncillaryRecord>,
+    credentials: VecDeque<CredentialRecord>,
+}
+
+struct AncillaryRecord {
+    end_seq: usize,
+    cmsg: Vec<CMsgData>,
+}
+
+struct CredentialRecord {
+    end_seq: usize,
+    credentials: UnixCredentials,
+}
+
+impl StreamMeta {
+    fn note_write(
+        &mut self,
+        count: usize,
+        cmsg: Option<Vec<CMsgData>>,
+        credentials: UnixCredentials,
+    ) {
+        self.write_seq = self.write_seq.saturating_add(count);
+        self.credentials.push_back(CredentialRecord {
+            end_seq: self.write_seq,
+            credentials,
+        });
+        if let Some(cmsg) = cmsg
+            && !cmsg.is_empty()
+        {
+            self.ancillary.push_back(AncillaryRecord {
+                end_seq: self.write_seq,
+                cmsg,
+            });
+        }
+    }
+
+    fn bytes_until_ancillary(&self) -> Option<usize> {
+        self.ancillary
+            .front()
+            .map(|record| record.end_seq.saturating_sub(self.read_seq))
+    }
+
+    fn bytes_until_credentials(&mut self) -> Option<usize> {
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= self.read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        self.credentials
+            .front()
+            .map(|record| record.end_seq.saturating_sub(self.read_seq))
+    }
+
+    fn note_read(
+        &mut self,
+        count: usize,
+        mut cmsg_dst: Option<&mut Vec<CMsgData>>,
+    ) -> Option<UnixCredentials> {
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= self.read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        let credentials = self
+            .credentials
+            .front()
+            .map(|record| record.credentials.clone());
+
+        self.read_seq = self.read_seq.saturating_add(count);
+        let read_seq = self.read_seq;
+        while self
+            .ancillary
+            .front()
+            .is_some_and(|record| record.end_seq <= read_seq)
+        {
+            let record = self.ancillary.pop_front().expect("record checked above");
+            if let Some(dst) = cmsg_dst.as_deref_mut() {
+                dst.extend(record.cmsg);
+            }
+        }
+        while self.credentials.len() > 1
+            && self
+                .credentials
+                .front()
+                .is_some_and(|record| record.end_seq <= read_seq)
+        {
+            self.credentials.pop_front();
+        }
+        credentials
+    }
 }
 
 pub struct Bind {
@@ -90,6 +200,8 @@ pub struct StreamTransport {
     conn_rx: Mutex<Option<(async_channel::Receiver<ConnRequest>, Arc<PollSet>)>>,
     poll_state: PollSet,
     general: GeneralOptions,
+    pass_credentials: AtomicBool,
+    current_credentials: Mutex<UnixCredentials>,
     pid: u32,
     rx_closed: AtomicBool,
     tx_closed: AtomicBool,
@@ -106,6 +218,8 @@ impl StreamTransport {
             conn_rx: Mutex::new(None),
             poll_state: PollSet::new(),
             general: GeneralOptions::default(),
+            pass_credentials: AtomicBool::new(false),
+            current_credentials: Mutex::new(UnixCredentials::new(pid)),
             pid,
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
@@ -133,7 +247,9 @@ impl Configurable for StreamTransport {
             O::SendBuffer(size) => {
                 **size = BUF_SIZE;
             }
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                **enabled = self.pass_credentials.load(Ordering::Relaxed);
+            }
             O::PeerCredentials(cred) => {
                 let peer_pid = self
                     .channel
@@ -141,6 +257,9 @@ impl Configurable for StreamTransport {
                     .as_ref()
                     .map_or(self.pid, |chan| chan.peer_pid);
                 **cred = UnixCredentials::new(peer_pid);
+            }
+            O::CurrentCredentials(cred) => {
+                **cred = self.current_credentials.lock().clone();
             }
             _ => return Ok(false),
         }
@@ -155,7 +274,12 @@ impl Configurable for StreamTransport {
         }
 
         match opt {
-            O::PassCredentials(_) => {}
+            O::PassCredentials(enabled) => {
+                self.pass_credentials.store(*enabled, Ordering::Relaxed);
+            }
+            O::CurrentCredentials(cred) => {
+                *self.current_credentials.lock() = cred.clone();
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -208,7 +332,14 @@ impl TransportOps for StreamTransport {
             channel,
             addr: peer_addr,
             pid,
-        } = rx.recv().await.map_err(|_| AxError::ConnectionReset)?;
+        } = if self.general.nonblocking() {
+            rx.try_recv().map_err(|err| match err {
+                async_channel::TryRecvError::Empty => AxError::WouldBlock,
+                async_channel::TryRecvError::Closed => AxError::ConnectionReset,
+            })?
+        } else {
+            rx.recv().await.map_err(|_| AxError::ConnectionReset)?
+        };
         Ok((
             Transport::Stream(StreamTransport::new_channel(Some(channel), pid)),
             peer_addr,
@@ -221,66 +352,99 @@ impl TransportOps for StreamTransport {
         }
         let size = src.remaining();
         let mut total = 0;
-        let non_blocking = self.general.nonblocking();
-        self.general.send_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
-            if !chan.tx.read_is_held() {
-                return Err(AxError::BrokenPipe);
-            }
-
-            let count = {
-                let (left, right) = chan.tx.vacant_slices_mut();
-                let mut count = src.read(unsafe { left.assume_init_mut() })?;
-                if count >= left.len() {
-                    count += src.read(unsafe { right.assume_init_mut() })?;
+        let mut cmsg = Some(options.cmsg);
+        let non_blocking =
+            self.general.nonblocking() || options.flags.contains(SendFlags::DONTWAIT);
+        self.general
+            .send_poller(self, options.flags.contains(SendFlags::DONTWAIT), || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
+                if !chan.tx.read_is_held() {
+                    return Err(AxError::BrokenPipe);
                 }
-                unsafe { chan.tx.advance_write_index(count) };
-                count
-            };
-            total += count;
-            if count > 0 {
-                chan.poll_update.wake();
-            }
 
-            if count == size || non_blocking {
-                Ok(total)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+                let count = {
+                    let (left, right) = chan.tx.vacant_slices_mut();
+                    let mut count = src.read(unsafe { left.assume_init_mut() })?;
+                    if count >= left.len() {
+                        count += src.read(unsafe { right.assume_init_mut() })?;
+                    }
+                    unsafe { chan.tx.advance_write_index(count) };
+                    count
+                };
+                total += count;
+                if count > 0 {
+                    chan.tx_meta.lock().note_write(
+                        count,
+                        cmsg.take(),
+                        self.current_credentials.lock().clone(),
+                    );
+                    chan.poll_update.wake();
+                }
+
+                if count == size || (non_blocking && total > 0) {
+                    Ok(total)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
     }
 
-    fn recv(&self, mut dst: impl Write, _options: RecvOptions) -> AxResult<usize> {
-        self.general.recv_poller(self, || {
-            let mut guard = self.channel.lock();
-            let Some(chan) = guard.as_mut() else {
-                return Err(AxError::NotConnected);
-            };
+    fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
+        self.general
+            .recv_poller(self, options.flags.contains(RecvFlags::DONTWAIT), || {
+                let mut guard = self.channel.lock();
+                let Some(chan) = guard.as_mut() else {
+                    return Err(AxError::NotConnected);
+                };
 
-            let count = {
-                let (left, right) = chan.rx.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
+                let count = {
+                    let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                    let read_limit = {
+                        let mut meta = chan.rx_meta.lock();
+                        let ancillary_limit = meta.bytes_until_ancillary();
+                        let credential_limit = pass_credentials
+                            .then(|| meta.bytes_until_credentials())
+                            .flatten();
+                        ancillary_limit.into_iter().chain(credential_limit).min()
+                    };
+                    let (left, right) = chan.rx.as_slices();
+                    let limit = read_limit.unwrap_or(usize::MAX);
+                    let left_len = left.len().min(limit);
+                    let mut count = dst.write(&left[..left_len])?;
+                    if count >= left_len && count < limit {
+                        let remaining = limit - count;
+                        count += dst.write(&right[..right.len().min(remaining)])?;
+                    }
+                    unsafe { chan.rx.advance_read_index(count) };
+                    count
+                };
+                if count > 0 {
+                    let pass_credentials = self.pass_credentials.load(Ordering::Relaxed);
+                    let received_credentials = {
+                        let mut meta = chan.rx_meta.lock();
+                        let credentials = meta.note_read(count, options.cmsg.as_deref_mut());
+                        pass_credentials.then_some(credentials).flatten()
+                    };
+                    if pass_credentials
+                        && let Some(cmsg) = options.cmsg.as_deref_mut()
+                        && let Some(credentials) = received_credentials
+                    {
+                        cmsg.push(Box::new(credentials));
+                    }
+                    chan.poll_update.wake();
+                    Ok(count)
+                } else if !chan.rx.write_is_held() {
+                    // Peer dropped its sender end and the ring is empty: EOF.
+                    // Returning WouldBlock here would park the caller forever
+                    // waiting for data that will never arrive.
+                    Ok(0)
+                } else {
+                    Err(AxError::WouldBlock)
                 }
-                unsafe { chan.rx.advance_read_index(count) };
-                count
-            };
-            if count > 0 {
-                chan.poll_update.wake();
-                Ok(count)
-            } else if !chan.rx.write_is_held() {
-                // Peer dropped its sender end and the ring is empty: EOF.
-                // Returning WouldBlock here would park the caller forever
-                // waiting for data that will never arrive.
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+            })
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {

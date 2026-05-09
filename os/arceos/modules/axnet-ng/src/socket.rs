@@ -73,6 +73,8 @@ bitflags! {
     /// See [`SocketOps::send`].
     #[derive(Default, Debug, Clone, Copy)]
     pub struct SendFlags: u32 {
+        /// Do not block for this send call.
+        const DONTWAIT = 0x40;
     }
 }
 
@@ -88,6 +90,8 @@ bitflags! {
         /// the real size of the datagram, even when it is larger than the
         /// buffer.
         const TRUNCATE = 0x02;
+        /// Do not block for this receive call.
+        const DONTWAIT = 0x40;
     }
 }
 

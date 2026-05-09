@@ -1,4 +1,4 @@
-use alloc::{format, string::ToString, sync::Arc};
+use alloc::{format, string::ToString, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_char, c_int},
     mem,
@@ -8,19 +8,28 @@ use core::{
 use ax_errno::{AxError, AxResult};
 use ax_fs::{FS_CONTEXT, FileBackend, OpenOptions, OpenResult};
 use ax_task::current;
-use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference};
+use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeType, Reference, path::Path};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
 
 use crate::{
     file::{
-        Directory, FD_TABLE, File, FileLike, Pipe, add_file_like, close_file_like, get_file_like,
-        with_fs,
+        Directory, FD_TABLE, File, FileDescriptor, FileLike, Pipe, add_file_like, close_file_like,
+        get_file_like, inotify, notify_file_descriptor_closed, with_fs,
     },
     mm::{UserPtr, vm_load_string},
     pseudofs::{Device, dev::tty},
-    task::AsThread,
+    task::{AX_FILE_LIMIT, AsThread},
 };
+
+fn parent_watch_target(
+    dirfd: c_int,
+    path: &str,
+) -> Option<(alloc::string::String, alloc::string::String)> {
+    let (dir, name) = with_fs(dirfd, |fs| fs.resolve_parent(Path::new(path))).ok()?;
+    let parent = dir.absolute_path().ok()?.to_string();
+    Some((parent, name.to_string()))
+}
 
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32)) -> OpenOptions {
@@ -59,7 +68,13 @@ fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32))
     options
 }
 
-fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
+struct OpenedFile {
+    fd: i32,
+    path: alloc::string::String,
+    is_dir: bool,
+}
+
+fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<OpenedFile> {
     let f: Arc<dyn FileLike> = match result {
         OpenResult::File(mut file) => {
             // /dev/xx handling
@@ -71,7 +86,13 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
                     if flags & O_NONBLOCK != 0 {
                         wrapped.set_nonblocking(true)?;
                     }
-                    return add_file_like(wrapped, flags & O_CLOEXEC != 0);
+                    let path = wrapped.path().into_owned();
+                    let fd = add_file_like(wrapped, flags & O_CLOEXEC != 0)?;
+                    return Ok(OpenedFile {
+                        fd,
+                        path,
+                        is_dir: false,
+                    });
                 }
                 if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                     // Opening /dev/ptmx creates a new pseudo-terminal
@@ -112,7 +133,10 @@ fn add_to_fd(result: OpenResult, flags: u32) -> AxResult<i32> {
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
     }
-    add_file_like(f, flags & O_CLOEXEC != 0)
+    let path = f.path().into_owned();
+    let is_dir = f.downcast_ref::<Directory>().is_some();
+    let fd = add_file_like(f, flags & O_CLOEXEC != 0)?;
+    Ok(OpenedFile { fd, path, is_dir })
 }
 
 /// Open or create a file.
@@ -134,9 +158,22 @@ pub fn sys_openat(
 
     let cred = current().as_thread().cred();
     let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
-    with_fs(dirfd, |fs| options.open(fs, path))
-        .and_then(|it| add_to_fd(it, flags as _))
-        .map(|fd| fd as isize)
+    let raw_flags = flags as u32;
+    let create_target = if raw_flags & O_CREAT != 0 {
+        with_fs(dirfd, |fs| fs.resolve_no_follow(&path))
+            .is_err()
+            .then(|| parent_watch_target(dirfd, &path))
+            .flatten()
+    } else {
+        None
+    };
+    let opened =
+        with_fs(dirfd, |fs| options.open(fs, path)).and_then(|it| add_to_fd(it, raw_flags))?;
+    if let Some((parent, name)) = create_target {
+        inotify::notify_child_event(&parent, &name, IN_CREATE, 0);
+    }
+    inotify::notify_opened(&opened.path, opened.is_dir);
+    Ok(opened.fd as isize)
 }
 
 /// Open a file by `filename` and insert it into the file descriptor table.
@@ -179,6 +216,7 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
 
     let cloexec = flags.contains(CloseRangeFlags::CLOEXEC);
     let mut fd_table = FD_TABLE.write();
+    let mut removed = Vec::new();
     if let Some(max_index) = fd_table.ids().next_back() {
         for fd in first..=last.min(max_index as i32) {
             if cloexec {
@@ -186,23 +224,47 @@ pub fn sys_close_range(first: i32, last: i32, flags: u32) -> AxResult<isize> {
                     f.cloexec = true;
                 }
             } else {
-                fd_table.remove(fd as _);
+                if let Some(file) = fd_table.remove(fd as _) {
+                    removed.push(file);
+                }
             }
         }
+    }
+    drop(fd_table);
+    for fd in &removed {
+        notify_file_descriptor_closed(fd);
     }
 
     Ok(0)
 }
 
-fn dup_fd(old_fd: c_int, cloexec: bool) -> AxResult<isize> {
+fn dup_fd(old_fd: c_int, min_fd: usize, cloexec: bool) -> AxResult<isize> {
     let f = get_file_like(old_fd)?;
-    let new_fd = add_file_like(f, cloexec)?;
-    Ok(new_fd as _)
+    let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE]
+        .current
+        .min(AX_FILE_LIMIT as u64) as usize;
+    if min_fd >= max_nofile {
+        return Err(AxError::InvalidInput);
+    }
+
+    let mut fd_table = FD_TABLE.write();
+    if fd_table.count() as u64 >= current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current
+    {
+        return Err(AxError::TooManyOpenFiles);
+    }
+    let mut fd = FileDescriptor { inner: f, cloexec };
+    for new_fd in min_fd..max_nofile {
+        match fd_table.add_at(new_fd, fd) {
+            Ok(_) => return Ok(new_fd as _),
+            Err(returned_fd) => fd = returned_fd,
+        }
+    }
+    Err(AxError::TooManyOpenFiles)
 }
 
 pub fn sys_dup(old_fd: c_int) -> AxResult<isize> {
     debug!("sys_dup <= {old_fd}");
-    dup_fd(old_fd, false)
+    dup_fd(old_fd, 0, false)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -248,8 +310,8 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
     debug!("sys_fcntl <= fd: {fd} cmd: {cmd} arg: {arg}");
 
     match cmd as u32 {
-        F_DUPFD => dup_fd(fd, false),
-        F_DUPFD_CLOEXEC => dup_fd(fd, true),
+        F_DUPFD => dup_fd(fd, arg, false),
+        F_DUPFD_CLOEXEC => dup_fd(fd, arg, true),
         F_SETLK | F_SETLKW => Ok(0),
         F_OFD_SETLK | F_OFD_SETLKW => Ok(0),
         F_GETLK | F_OFD_GETLK => {

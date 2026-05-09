@@ -19,9 +19,12 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
     mm::UserPtr,
-    pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
+    pseudofs::{Device, DeviceOps, DirMapping, SimpleFs, sys},
 };
 const KEY_CNT: usize = EventType::Key.bits_count();
+const INPUT_MAJOR: u32 = 13;
+const INPUT_MICE_MINOR: u32 = 63;
+const INPUT_EVENT_MINOR_BASE: u32 = 64;
 
 struct Inner {
     device: AxInputDevice,
@@ -323,26 +326,47 @@ impl Pollable for EventDev {
 
 pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
     let mut inputs = DirMapping::new();
-    let mut input_id = 0;
     let input_devices = ax_input::take_inputs();
-    let mut keys = [0; 0x300usize.div_ceil(8)];
-    for (i, mut device) in input_devices.into_iter().enumerate() {
-        assert!(device.get_event_bits(EventType::Key, &mut keys).unwrap());
+    let mut has_mice = false;
+    for (input_id, mut device) in input_devices.into_iter().enumerate() {
+        let mut keys = [0; 0x300usize.div_ceil(8)];
+        let has_keys = match device.get_event_bits(EventType::Key, &mut keys) {
+            Ok(has_keys) => has_keys,
+            Err(err) => {
+                warn!("Failed to query input key bits: {err:?}");
+                false
+            }
+        };
+        const BTN_MOUSE: usize = 0x110;
+        let is_mouse = has_keys && keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0;
 
+        let ops = Arc::new(EventDev::new(device));
         let dev = Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(13, (i + 1) as _),
-            Arc::new(EventDev::new(device)),
+            DeviceId::new(INPUT_MAJOR, INPUT_EVENT_MINOR_BASE + input_id as u32),
+            ops.clone(),
         );
 
-        const BTN_MOUSE: usize = 0x110;
-        if keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0 {
-            // Mouse
-            inputs.add("mice", dev);
-        } else {
-            inputs.add(format!("event{input_id}"), dev);
-            input_id += 1;
+        let event_name = format!("event{input_id}");
+        sys::register_input_device(
+            event_name.clone(),
+            INPUT_MAJOR,
+            INPUT_EVENT_MINOR_BASE + input_id as u32,
+        );
+        inputs.add(event_name, dev.clone());
+        if is_mouse && !has_mice {
+            sys::register_input_device("mice".into(), INPUT_MAJOR, INPUT_MICE_MINOR);
+            inputs.add(
+                "mice",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(INPUT_MAJOR, INPUT_MICE_MINOR),
+                    ops,
+                ),
+            );
+            has_mice = true;
         }
     }
     inputs

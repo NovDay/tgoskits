@@ -677,8 +677,16 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg3() as _,
         ),
 
+        // inotify file descriptors
+        Sysno::inotify_init1 => sys_inotify_init1(uctx.arg0() as _),
+        Sysno::inotify_add_watch => {
+            sys_inotify_add_watch(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
+        Sysno::inotify_rm_watch => sys_inotify_rm_watch(uctx.arg0() as _, uctx.arg1() as _),
+
         // dummy fds
-        Sysno::userfaultfd
+        Sysno::fanotify_init
+        | Sysno::userfaultfd
         | Sysno::perf_event_open
         | Sysno::io_uring_setup
         | Sysno::bpf
@@ -686,8 +694,6 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         | Sysno::fspick
         | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),
-
-        Sysno::fanotify_init | Sysno::inotify_init1 => Err(AxError::Unsupported),
 
         Sysno::timer_create => {
             sys_timer_create(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)

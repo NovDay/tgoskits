@@ -1,4 +1,4 @@
-use alloc::{ffi::CString, vec, vec::Vec};
+use alloc::{ffi::CString, string::ToString, vec, vec::Vec};
 use core::{
     ffi::{c_char, c_int},
     mem::offset_of,
@@ -17,12 +17,21 @@ use linux_raw_sys::{
 use starry_vm::{VmPtr, vm_write_slice};
 
 use crate::{
-    file::{Directory, FileLike, get_file_like, resolve_at, with_fs},
+    file::{Directory, FileLike, get_file_like, inotify, resolve_at, with_fs},
     mm::vm_load_string,
     pseudofs::Device,
     task::AsThread,
     time::TimeValueLike,
 };
+
+fn parent_watch_target(
+    dirfd: c_int,
+    path: &str,
+) -> Option<(alloc::string::String, alloc::string::String)> {
+    let (dir, name) = with_fs(dirfd, |fs| fs.resolve_parent(Path::new(path))).ok()?;
+    let parent = dir.absolute_path().ok()?.to_string();
+    Some((parent, name.to_string()))
+}
 
 /// The ioctl() system call manipulates the underlying device parameters
 /// of special files.
@@ -91,6 +100,7 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
     let mode = mode & !current().as_thread().proc_data.umask();
     let mode = NodePermission::from_bits_truncate(mode as u16);
 
+    let watch_target = parent_watch_target(dirfd, &path);
     with_fs(dirfd, |fs| match fs.create_dir(&path, mode) {
         Ok(_) => Ok(0),
         // mkdir on an existing path should report EEXIST.
@@ -100,7 +110,11 @@ pub fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> AxResult<isize
             Err(AxError::AlreadyExists)
         }
         Err(err) => Err(err),
-    })
+    })?;
+    if let Some((parent, name)) = watch_target {
+        inotify::notify_child_event(&parent, &name, IN_CREATE | IN_ISDIR, 0);
+    }
+    Ok(0)
 }
 
 pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Result<isize, AxError> {
@@ -126,6 +140,7 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Resu
         _ => return Err(AxError::InvalidInput),
     };
 
+    let watch_target = parent_watch_target(dirfd, &path);
     let res = with_fs(dirfd, |fs| {
         let (dir, name) = fs.resolve_nonexistent(Path::new(&path))?;
         let loc = dir.create(
@@ -145,6 +160,9 @@ pub fn sys_mknodat(dirfd: i32, path: *const c_char, mode: u32, dev: u64) -> Resu
 
         Ok(0)
     })?;
+    if let Some((parent, name)) = watch_target {
+        inotify::notify_child_event(&parent, &name, IN_CREATE, 0);
+    }
     Ok(res)
 }
 
@@ -268,6 +286,9 @@ pub fn sys_linkat(
         with_fs(new_dirfd, |fs| fs.resolve_nonexistent(Path::new(&new_path)))?;
 
     new_dir.link(new_name, &old)?;
+    if let Ok(parent) = new_dir.absolute_path() {
+        inotify::notify_child_event(parent.as_ref(), new_name, IN_CREATE, 0);
+    }
     Ok(0)
 }
 
@@ -293,6 +314,13 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
         return Err(AxError::InvalidInput);
     }
 
+    let watch_target = parent_watch_target(dirfd, &path);
+    let target_path = with_fs(dirfd, |fs| {
+        fs.resolve_no_follow(&path)
+            .and_then(|loc| loc.absolute_path())
+    })
+    .ok()
+    .map(|path| path.to_string());
     with_fs(dirfd, |fs| {
         if flags & AT_REMOVEDIR as usize != 0 {
             fs.remove_dir(path)?;
@@ -300,7 +328,19 @@ pub fn sys_unlinkat(dirfd: i32, path: *const c_char, flags: usize) -> AxResult<i
             fs.remove_file(path)?;
         }
         Ok(0)
-    })
+    })?;
+    if let Some((parent, name)) = watch_target {
+        let mask = if flags & AT_REMOVEDIR as usize != 0 {
+            IN_DELETE | IN_ISDIR
+        } else {
+            IN_DELETE
+        };
+        inotify::notify_child_event(&parent, &name, mask, 0);
+    }
+    if let Some(path) = target_path {
+        inotify::notify_deleted(&path, flags & AT_REMOVEDIR as usize != 0);
+    }
+    Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -348,10 +388,15 @@ pub fn sys_symlinkat(
     let linkpath = vm_load_string(linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
+    let watch_target = parent_watch_target(new_dirfd, &linkpath);
     with_fs(new_dirfd, |fs| {
         fs.symlink(target, linkpath)?;
         Ok(0)
-    })
+    })?;
+    if let Some((parent, name)) = watch_target {
+        inotify::notify_child_event(&parent, &name, IN_CREATE, 0);
+    }
+    Ok(0)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -449,6 +494,9 @@ pub fn sys_fchownat(
         mode: Some(mode),
         ..Default::default()
     })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(0)
 }
 
@@ -485,6 +533,9 @@ pub fn sys_fchmodat(dirfd: i32, path: *const c_char, mode: u32, flags: u32) -> A
         mode: Some(NodePermission::from_bits_truncate(mode as u16)),
         ..Default::default()
     })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(0)
 }
 
@@ -496,14 +547,17 @@ fn update_times(
     flags: u32,
 ) -> AxResult<()> {
     let path = path.nullable().map(vm_load_string).transpose()?;
-    resolve_at(dirfd, path.as_deref(), flags)?
+    let loc = resolve_at(dirfd, path.as_deref(), flags)?
         .into_file()
-        .ok_or(AxError::BadFileDescriptor)?
-        .update_metadata(MetadataUpdate {
-            atime,
-            mtime,
-            ..Default::default()
-        })?;
+        .ok_or(AxError::BadFileDescriptor)?;
+    loc.update_metadata(MetadataUpdate {
+        atime,
+        mtime,
+        ..Default::default()
+    })?;
+    if let Ok(path) = loc.absolute_path() {
+        inotify::notify_attrib(path.as_ref());
+    }
     Ok(())
 }
 
@@ -621,6 +675,8 @@ pub fn sys_renameat2(
 
     let (old_dir, old_name) = with_fs(old_dirfd, |fs| fs.resolve_parent(Path::new(&old_path)))?;
     let (new_dir, new_name) = with_fs(new_dirfd, |fs| fs.resolve_parent(Path::new(&new_path)))?;
+    let old_parent = old_dir.absolute_path().ok().map(|path| path.to_string());
+    let new_parent = new_dir.absolute_path().ok().map(|path| path.to_string());
 
     if flags & RENAME_NOREPLACE != 0 {
         // Linux reports a missing source leaf before checking whether the
@@ -634,6 +690,13 @@ pub fn sys_renameat2(
     }
 
     old_dir.rename(&old_name, &new_dir, &new_name)?;
+    let cookie = inotify::next_event_cookie();
+    if let Some(parent) = old_parent {
+        inotify::notify_child_event(&parent, &old_name, IN_MOVED_FROM, cookie);
+    }
+    if let Some(parent) = new_parent {
+        inotify::notify_child_event(&parent, &new_name, IN_MOVED_TO, cookie);
+    }
     Ok(0)
 }
 

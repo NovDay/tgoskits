@@ -113,10 +113,11 @@ impl FrameBuffer {
 impl DeviceOps for FrameBuffer {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let slice = self.as_mut_slice();
+        let start = offset.min(slice.len() as u64) as usize;
         let len = buf
             .len()
             .min((slice.len() as u64).saturating_sub(offset) as usize);
-        buf[..len].copy_from_slice(&slice[..len]);
+        buf[..len].copy_from_slice(&slice[start..start + len]);
         Ok(len)
     }
 
@@ -125,8 +126,9 @@ impl DeviceOps for FrameBuffer {
         if offset >= slice.len() as u64 {
             return Err(VfsError::StorageFull);
         }
-        let len = buf.len().min(slice.len() - offset as usize);
-        slice[..len].copy_from_slice(&buf[..len]);
+        let start = offset as usize;
+        let len = buf.len().min(slice.len() - start);
+        slice[start..start + len].copy_from_slice(&buf[..len]);
         Ok(len)
     }
 
