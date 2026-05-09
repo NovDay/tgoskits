@@ -12,6 +12,8 @@ const DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o755)
 const FILE_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o444);
 const FRAMEBUFFER_MAJOR: u32 = 29;
 const FRAMEBUFFER_MINOR: u32 = 0;
+const DRM_MAJOR: u32 = 226;
+const DRM_CARD0_MINOR: u32 = 0;
 
 static INPUT_DEVICES: Lazy<Mutex<Vec<SysfsDevice>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -33,6 +35,23 @@ pub(crate) fn framebuffer_device() -> Option<SysfsDevice> {
         major: FRAMEBUFFER_MAJOR,
         minor: FRAMEBUFFER_MINOR,
     })
+}
+
+pub(crate) fn drm_card0_device() -> Option<SysfsDevice> {
+    #[cfg(all(feature = "rknpu", not(any(windows, unix))))]
+    {
+        None
+    }
+    #[cfg(not(all(feature = "rknpu", not(any(windows, unix)))))]
+    {
+        ax_display::has_display().then(|| SysfsDevice {
+            name: "card0".into(),
+            class: "drm",
+            devname: "dri/card0".into(),
+            major: DRM_MAJOR,
+            minor: DRM_CARD0_MINOR,
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -207,6 +226,63 @@ fn populate_graphics(fs: &FsContext) -> LinuxResult<()> {
 }
 
 #[allow(dead_code)]
+fn populate_drm(fs: &FsContext) -> LinuxResult<()> {
+    if let Some(device) = drm_card0_device() {
+        let major = device.major;
+        let minor = device.minor;
+        ensure_path_dirs(fs, "/sys/class/drm/card0")?;
+        write_file(
+            fs,
+            "/sys/class/drm/card0/dev",
+            &format!("{major}:{minor}\n"),
+        )?;
+        write_file(fs, "/sys/class/drm/card0/name", "card0\n")?;
+        write_uevent(
+            fs,
+            "/sys/class/drm/card0/uevent",
+            &device.devname,
+            major,
+            minor,
+        )?;
+        ensure_symlink(fs, "../../../class/drm", "/sys/class/drm/card0/subsystem")?;
+        ensure_symlink(
+            fs,
+            "../../../devices/virtual/drm/card0",
+            "/sys/class/drm/card0/device",
+        )?;
+
+        ensure_path_dirs(fs, "/sys/devices/virtual/drm/card0")?;
+        ensure_dev_char_link(fs, major, minor, "../../devices/virtual/drm/card0")?;
+        write_file(
+            fs,
+            "/sys/devices/virtual/drm/card0/dev",
+            &format!("{major}:{minor}\n"),
+        )?;
+        write_file(fs, "/sys/devices/virtual/drm/card0/name", "card0\n")?;
+        write_uevent(
+            fs,
+            "/sys/devices/virtual/drm/card0/uevent",
+            &device.devname,
+            major,
+            minor,
+        )?;
+        write_udev_data(
+            fs,
+            major,
+            minor,
+            &device.devname,
+            &["ID_PATH=platform-starry-drm"],
+        )?;
+        ensure_symlink(
+            fs,
+            "../../../../class/drm",
+            "/sys/devices/virtual/drm/card0/subsystem",
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn populate_input(fs: &FsContext) -> LinuxResult<()> {
     let input_devices = input_devices();
     if input_devices.is_empty() {
@@ -289,6 +365,15 @@ pub fn populate_udev_data() -> LinuxResult<()> {
     if let Some(device) = framebuffer_device() {
         write_udev_data(&fs, device.major, device.minor, &device.devname, &[])?;
     }
+    if let Some(device) = drm_card0_device() {
+        write_udev_data(
+            &fs,
+            device.major,
+            device.minor,
+            &device.devname,
+            &["ID_PATH=platform-starry-drm"],
+        )?;
+    }
     for device in input_devices() {
         write_udev_data(
             &fs,
@@ -305,6 +390,7 @@ pub fn populate_udev_data() -> LinuxResult<()> {
 pub fn populate_sysfs() -> LinuxResult<()> {
     let fs = FS_CONTEXT.lock();
     populate_graphics(&fs)?;
+    populate_drm(&fs)?;
     populate_input(&fs)?;
     drop(fs);
 

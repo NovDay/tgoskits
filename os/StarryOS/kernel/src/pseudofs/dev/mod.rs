@@ -8,6 +8,7 @@ mod card1;
 mod dma_heap;
 #[cfg(all(feature = "rknpu", not(any(windows, unix))))]
 mod drm;
+mod drm_card;
 #[cfg(feature = "input")]
 mod event;
 mod fb;
@@ -290,6 +291,23 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         );
         root.add("bus", SimpleDir::new_maker(fs.clone(), Arc::new(bus_dir)));
     }
+    let mut dri_dir = DirMapping::new();
+    let mut has_dri = false;
+    #[cfg(not(all(feature = "rknpu", not(any(windows, unix)))))]
+    {
+        if ax_display::has_display() {
+            dri_dir.add(
+                "card0",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    drm_card::CARD0_DEVICE_ID,
+                    Arc::new(drm_card::DrmCard::new()),
+                ),
+            );
+            has_dri = true;
+        }
+    }
 
     #[cfg(all(feature = "rknpu", not(any(windows, unix))))]
     {
@@ -309,8 +327,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             SimpleDir::new_maker(fs.clone(), Arc::new(dma_heap_dir)),
         );
 
-        // DRI devices
-        let mut dri_dir = DirMapping::new();
+        // Rockchip/RKNPU-specific DRI devices
         dri_dir.add(
             "card0",
             Device::new(
@@ -329,6 +346,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 Arc::new(card1::Card1::new()),
             ),
         );
+        has_dri = true;
+    }
+    if has_dri {
         root.add("dri", SimpleDir::new_maker(fs.clone(), Arc::new(dri_dir)));
     }
 

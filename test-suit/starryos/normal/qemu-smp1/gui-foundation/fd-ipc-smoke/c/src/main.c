@@ -1010,6 +1010,112 @@ static int test_epoll_unix_listener_and_client(void) {
     return 0;
 }
 
+static int test_epoll_level_listener_single_batch_event(void) {
+    int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (server < 0) {
+        fprintf(stderr, "FAIL: epoll batch listener socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/fd-ipc-epoll-batch-%u.sock",
+             (unsigned)getpid());
+    unlink(addr.sun_path);
+
+    if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: bind epoll batch listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (listen(server, 128) != 0) {
+        fprintf(stderr, "FAIL: listen epoll batch listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        fprintf(stderr, "FAIL: epoll_create1 batch listener: %s\n", strerror(errno));
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = 0x4444,
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server, &event) != 0) {
+        fprintf(stderr, "FAIL: epoll_ctl batch listener add: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        fprintf(stderr, "FAIL: epoll batch client socket: %s\n", strerror(errno));
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "FAIL: connect epoll batch client: %s\n", strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    struct epoll_event events[8];
+    int ready = epoll_wait(epfd, events, 8, 1000);
+    if (ready != 1 || (events[0].events & EPOLLIN) == 0 || events[0].data.u64 != 0x4444) {
+        fprintf(stderr,
+                "FAIL: epoll batch listener ready=%d first_events=%#x first_data=%#llx errno=%s\n",
+                ready, events[0].events, (unsigned long long)events[0].data.u64, strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    int accepted = accept4(server, NULL, NULL, SOCK_CLOEXEC);
+    if (accepted < 0) {
+        fprintf(stderr, "FAIL: accept epoll batch client: %s\n", strerror(errno));
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    ready = epoll_wait(epfd, events, 8, 0);
+    if (ready != 0) {
+        fprintf(stderr, "FAIL: drained epoll batch listener ready=%d events=%#x errno=%s\n", ready,
+                events[0].events, strerror(errno));
+        close(accepted);
+        close(client);
+        close(epfd);
+        close(server);
+        unlink(addr.sun_path);
+        return 1;
+    }
+
+    close(accepted);
+    close(client);
+    close(epfd);
+    close(server);
+    unlink(addr.sun_path);
+    return 0;
+}
+
 static int test_epoll_timeout_and_dupfd_readiness(void) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
@@ -1359,6 +1465,9 @@ int main(void) {
         return 1;
     }
     if (test_epoll_unix_listener_and_client() != 0) {
+        return 1;
+    }
+    if (test_epoll_level_listener_single_batch_event() != 0) {
         return 1;
     }
     if (test_epoll_timeout_and_dupfd_readiness() != 0) {

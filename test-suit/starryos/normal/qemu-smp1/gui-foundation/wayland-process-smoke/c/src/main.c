@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -51,15 +52,80 @@
 #define F_SEAL_WRITE 0x0008
 #endif
 
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOGET_FSCREENINFO 0x4602
+
+struct fb_bitfield {
+    uint32_t offset;
+    uint32_t length;
+    uint32_t msb_right;
+};
+
+struct fb_var_screeninfo {
+    uint32_t xres;
+    uint32_t yres;
+    uint32_t xres_virtual;
+    uint32_t yres_virtual;
+    uint32_t xoffset;
+    uint32_t yoffset;
+    uint32_t bits_per_pixel;
+    uint32_t grayscale;
+    struct fb_bitfield red;
+    struct fb_bitfield green;
+    struct fb_bitfield blue;
+    struct fb_bitfield transp;
+    uint32_t nonstd;
+    uint32_t activate;
+    uint32_t height;
+    uint32_t width;
+    uint32_t accel_flags;
+    uint32_t pixclock;
+    uint32_t left_margin;
+    uint32_t right_margin;
+    uint32_t upper_margin;
+    uint32_t lower_margin;
+    uint32_t hsync_len;
+    uint32_t vsync_len;
+    uint32_t sync;
+    uint32_t vmode;
+    uint32_t rotate;
+    uint32_t colorspace;
+    uint32_t reserved[4];
+};
+
+struct fb_fix_screeninfo {
+    uint8_t id[16];
+    uint64_t smem_start;
+    uint32_t smem_len;
+    uint32_t type;
+    uint32_t type_aux;
+    uint32_t visual;
+    uint16_t xpanstep;
+    uint16_t ypanstep;
+    uint16_t ywrapstep;
+    uint32_t line_length;
+    uint64_t mmio_start;
+    uint32_t mmio_len;
+    uint32_t accel;
+    uint16_t capabilities;
+    uint16_t reserved[2];
+};
+
 struct ServerState {
     struct wl_display *display;
     struct wl_global *compositor_global;
     struct wl_event_source *listener_source;
     int listener_fd;
+    int fb_fd;
+    uint8_t *fb;
+    struct fb_var_screeninfo fb_var;
+    struct fb_fix_screeninfo fb_fix;
     char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    struct wl_resource *attached_buffer;
     bool surface_created;
     bool buffer_attached;
     bool surface_committed;
+    bool framebuffer_blitted;
     bool surface_destroyed;
 };
 
@@ -104,6 +170,123 @@ static int create_cloexec_memfd(const char *name) {
     return fd;
 }
 
+static uint32_t pack_fb_rgb(const struct fb_var_screeninfo *var, uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t pixel = 0;
+    pixel |= ((uint32_t)r >> (8 - var->red.length)) << var->red.offset;
+    pixel |= ((uint32_t)g >> (8 - var->green.length)) << var->green.offset;
+    pixel |= ((uint32_t)b >> (8 - var->blue.length)) << var->blue.offset;
+    if (var->transp.length > 0) {
+        pixel |= ((1u << var->transp.length) - 1u) << var->transp.offset;
+    }
+    return pixel;
+}
+
+static bool valid_color_field(const struct fb_bitfield *field, uint32_t bits_per_pixel) {
+    return field->length > 0 && field->length <= 8 && field->offset < bits_per_pixel &&
+           field->offset + field->length <= bits_per_pixel;
+}
+
+static void put_fb_pixel(struct ServerState *state, uint32_t x, uint32_t y, uint32_t pixel) {
+    size_t offset =
+        (size_t)y * state->fb_fix.line_length + (size_t)x * (state->fb_var.bits_per_pixel / 8);
+    memcpy(state->fb + offset, &pixel, state->fb_var.bits_per_pixel / 8);
+}
+
+static uint32_t get_fb_pixel(const struct ServerState *state, uint32_t x, uint32_t y) {
+    uint32_t pixel = 0;
+    size_t offset =
+        (size_t)y * state->fb_fix.line_length + (size_t)x * (state->fb_var.bits_per_pixel / 8);
+    memcpy(&pixel, state->fb + offset, state->fb_var.bits_per_pixel / 8);
+    return pixel;
+}
+
+static int setup_framebuffer(struct ServerState *state) {
+    state->fb_fd = open("/dev/fb0", O_RDWR);
+    if (state->fb_fd < 0) {
+        fprintf(stderr, "FAIL: open /dev/fb0 for Wayland blit: %s\n", strerror(errno));
+        return 1;
+    }
+    if (ioctl(state->fb_fd, FBIOGET_VSCREENINFO, &state->fb_var) != 0) {
+        fprintf(stderr, "FAIL: FBIOGET_VSCREENINFO for Wayland blit: %s\n", strerror(errno));
+        return 1;
+    }
+    if (ioctl(state->fb_fd, FBIOGET_FSCREENINFO, &state->fb_fix) != 0) {
+        fprintf(stderr, "FAIL: FBIOGET_FSCREENINFO for Wayland blit: %s\n", strerror(errno));
+        return 1;
+    }
+    if (state->fb_var.xres < 8 || state->fb_var.yres < 8 || state->fb_fix.smem_len == 0 ||
+        state->fb_fix.line_length == 0 ||
+        (state->fb_var.bits_per_pixel != 24 && state->fb_var.bits_per_pixel != 32)) {
+        fprintf(stderr, "FAIL: unsupported framebuffer for Wayland blit %ux%u@%u line=%u\n",
+                state->fb_var.xres, state->fb_var.yres, state->fb_var.bits_per_pixel,
+                state->fb_fix.line_length);
+        return 1;
+    }
+    if (!valid_color_field(&state->fb_var.red, state->fb_var.bits_per_pixel) ||
+        !valid_color_field(&state->fb_var.green, state->fb_var.bits_per_pixel) ||
+        !valid_color_field(&state->fb_var.blue, state->fb_var.bits_per_pixel) ||
+        state->fb_var.transp.length > 8 ||
+        state->fb_var.transp.offset + state->fb_var.transp.length > state->fb_var.bits_per_pixel) {
+        fprintf(stderr, "FAIL: unsupported framebuffer bitfields r=%u:%u g=%u:%u b=%u:%u a=%u:%u\n",
+                state->fb_var.red.offset, state->fb_var.red.length, state->fb_var.green.offset,
+                state->fb_var.green.length, state->fb_var.blue.offset, state->fb_var.blue.length,
+                state->fb_var.transp.offset, state->fb_var.transp.length);
+        return 1;
+    }
+    state->fb =
+        mmap(NULL, state->fb_fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, state->fb_fd, 0);
+    if (state->fb == MAP_FAILED) {
+        fprintf(stderr, "FAIL: mmap /dev/fb0 for Wayland blit: %s\n", strerror(errno));
+        state->fb = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+static int blit_shm_buffer_to_framebuffer(struct ServerState *state) {
+    if (state->attached_buffer == NULL) {
+        fprintf(stderr, "FAIL: commit without attached Wayland buffer\n");
+        return 1;
+    }
+    struct wl_shm_buffer *shm_buffer = wl_shm_buffer_get(state->attached_buffer);
+    if (shm_buffer == NULL) {
+        fprintf(stderr, "FAIL: attached Wayland buffer is not wl_shm\n");
+        return 1;
+    }
+    if (wl_shm_buffer_get_format(shm_buffer) != WL_SHM_FORMAT_ARGB8888 ||
+        wl_shm_buffer_get_width(shm_buffer) < 8 || wl_shm_buffer_get_height(shm_buffer) < 8) {
+        fprintf(stderr, "FAIL: unexpected wl_shm buffer format=%u size=%dx%d\n",
+                wl_shm_buffer_get_format(shm_buffer), wl_shm_buffer_get_width(shm_buffer),
+                wl_shm_buffer_get_height(shm_buffer));
+        return 1;
+    }
+
+    wl_shm_buffer_begin_access(shm_buffer);
+    const uint8_t *src = wl_shm_buffer_get_data(shm_buffer);
+    int stride = wl_shm_buffer_get_stride(shm_buffer);
+    for (uint32_t y = 0; y < 8; y++) {
+        const uint32_t *row = (const uint32_t *)(src + (size_t)y * (size_t)stride);
+        for (uint32_t x = 0; x < 8; x++) {
+            uint32_t argb = row[x];
+            uint8_t r = (uint8_t)((argb >> 16) & 0xff);
+            uint8_t g = (uint8_t)((argb >> 8) & 0xff);
+            uint8_t b = (uint8_t)(argb & 0xff);
+            put_fb_pixel(state, x, y, pack_fb_rgb(&state->fb_var, r, g, b));
+        }
+    }
+    wl_shm_buffer_end_access(shm_buffer);
+
+    uint32_t expected = pack_fb_rgb(&state->fb_var, 7, 7, 0);
+    uint32_t observed = get_fb_pixel(state, 7, 7);
+    if (observed != expected) {
+        fprintf(stderr, "FAIL: Wayland framebuffer blit readback got=%#x expected=%#x\n",
+                observed, expected);
+        return 1;
+    }
+    state->framebuffer_blitted = true;
+    return 0;
+}
+
 static void surface_destroy(struct wl_client *client, struct wl_resource *resource) {
     (void)client;
     struct ServerState *state = wl_resource_get_user_data(resource);
@@ -122,6 +305,7 @@ static void surface_attach(
     (void)y;
     struct ServerState *state = wl_resource_get_user_data(resource);
     state->buffer_attached = buffer != NULL;
+    state->attached_buffer = buffer;
 }
 
 static void surface_damage(
@@ -170,6 +354,10 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
     (void)client;
     struct ServerState *state = wl_resource_get_user_data(resource);
     state->surface_committed = true;
+    if (blit_shm_buffer_to_framebuffer(state) != 0) {
+        wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
+                               "failed to blit shm buffer to framebuffer");
+    }
 }
 
 static void surface_set_buffer_transform(
@@ -338,6 +526,10 @@ static int accept_wayland_client(int fd, uint32_t mask, void *data) {
 
 static int setup_server(struct ServerState *state) {
     state->listener_fd = -1;
+    state->fb_fd = -1;
+    if (setup_framebuffer(state) != 0) {
+        return 1;
+    }
     state->display = wl_display_create();
     if (state->display == NULL) {
         fprintf(stderr, "FAIL: wl_display_create returned NULL\n");
@@ -403,6 +595,12 @@ static void cleanup_server(struct ServerState *state) {
     }
     if (state->listener_fd >= 0) {
         close(state->listener_fd);
+    }
+    if (state->fb != NULL) {
+        munmap(state->fb, state->fb_fix.smem_len);
+    }
+    if (state->fb_fd >= 0) {
+        close(state->fb_fd);
     }
     if (state->socket_path[0] != '\0') {
         unlink(state->socket_path);
@@ -735,10 +933,11 @@ int main(void) {
     int rc = run_server_until_child_exit(&server, child);
     if (rc == 0 &&
         (!server.surface_created || !server.buffer_attached || !server.surface_committed ||
-         !server.surface_destroyed)) {
-        fprintf(stderr, "FAIL: lifecycle created=%d attached=%d committed=%d destroyed=%d\n",
+         !server.framebuffer_blitted || !server.surface_destroyed)) {
+        fprintf(stderr,
+                "FAIL: lifecycle created=%d attached=%d committed=%d blitted=%d destroyed=%d\n",
                 server.surface_created, server.buffer_attached, server.surface_committed,
-                server.surface_destroyed);
+                server.framebuffer_blitted, server.surface_destroyed);
         rc = 1;
     }
 
@@ -748,7 +947,7 @@ int main(void) {
         return 1;
     }
 
-    printf("Wayland independent process shm surface lifecycle tests passed\n");
+    printf("Wayland independent process shm surface lifecycle and framebuffer blit tests passed\n");
     printf("All Wayland process smoke tests passed!\n");
     return 0;
 }

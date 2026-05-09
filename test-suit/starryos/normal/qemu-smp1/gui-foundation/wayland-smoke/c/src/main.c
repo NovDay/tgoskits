@@ -371,6 +371,34 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
+static int probe_auto_socket(void) {
+    trace_step("probe auto Wayland display socket");
+    if (setenv("XDG_RUNTIME_DIR", "/tmp", 1) != 0) {
+        fprintf(stderr, "FAIL: setenv XDG_RUNTIME_DIR for auto probe: %s\n", strerror(errno));
+        return 1;
+    }
+    struct wl_display *display = wl_display_create();
+    if (display == NULL) {
+        fprintf(stderr, "FAIL: wl_display_create auto probe returned NULL\n");
+        return 1;
+    }
+    const char *socket_name = wl_display_add_socket_auto(display);
+    if (socket_name == NULL) {
+        fprintf(stderr, "FAIL: wl_display_add_socket_auto probe: %s\n", strerror(errno));
+        wl_display_destroy(display);
+        return 1;
+    }
+    struct wl_display *client = wl_display_connect(socket_name);
+    if (client == NULL) {
+        fprintf(stderr, "FAIL: wl_display_connect auto probe: %s\n", strerror(errno));
+        wl_display_destroy(display);
+        return 1;
+    }
+    wl_display_disconnect(client);
+    wl_display_destroy(display);
+    return 0;
+}
+
 static int accept_wayland_client(int fd, uint32_t mask, void *data) {
     struct TestState *state = data;
 
@@ -501,6 +529,10 @@ static void cleanup_wayland_pair(struct TestState *state) {
 int main(void) {
     signal(SIGALRM, fail_on_timeout);
     alarm(10);
+
+    if (probe_auto_socket() != 0) {
+        return 1;
+    }
 
     struct TestState state = {.server_fd = -1};
     if (setup_wayland_pair(&state) != 0) {
