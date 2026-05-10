@@ -9,7 +9,7 @@ use ax_errno::{AxError, AxResult};
 use ax_hal::time::wall_time;
 use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::{__kernel_old_time_t, __kernel_suseconds_t},
@@ -57,6 +57,7 @@ impl Inner {
 
 pub struct EventDev {
     inner: Mutex<Inner>,
+    poll_rx: Arc<PollSet>,
     ev_bits: Bitmap<{ EventType::COUNT as usize }>,
 }
 
@@ -93,6 +94,7 @@ impl EventDev {
                 read_ahead: None,
                 key_state: Bitmap::new(),
             }),
+            poll_rx: Arc::new(PollSet::new()),
             ev_bits,
         }
     }
@@ -319,9 +321,22 @@ impl Pollable for EventDev {
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::IN) {
-            context.waker().wake_by_ref();
+            self.poll_rx.register(context.waker());
         }
     }
+}
+
+fn spawn_input_poll_task(dev: Arc<EventDev>) {
+    ax_task::spawn_with_name(
+        move || loop {
+            ax_task::sleep(Duration::from_millis(10));
+            let has_event = dev.inner.lock().has_event();
+            if has_event {
+                dev.poll_rx.wake();
+            }
+        },
+        "input-poll".into(),
+    );
 }
 
 pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
@@ -341,6 +356,7 @@ pub fn input_devices(fs: Arc<SimpleFs>) -> DirMapping {
         let is_mouse = has_keys && keys[BTN_MOUSE / 8] & (1 << (BTN_MOUSE % 8)) != 0;
 
         let ops = Arc::new(EventDev::new(device));
+        spawn_input_poll_task(ops.clone());
         let dev = Device::new(
             fs.clone(),
             NodeType::CharacterDevice,

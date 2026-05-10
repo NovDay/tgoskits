@@ -294,8 +294,41 @@ static int check_libinput_udev_seat(void) {
         udev_unref(udev);
         return 1;
     }
+    if (poll_rc != 0 || pfd.revents != 0) {
+        fprintf(stderr, "FAIL: idle libinput udev fd should not be readable poll_rc=%d "
+                        "revents=0x%x\n",
+                poll_rc, pfd.revents);
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
     printf("libinput udev seat assigned; fd=%d poll_rc=%d revents=0x%x\n", pfd.fd, poll_rc,
            pfd.revents);
+
+    trace_step("dispatch libinput udev seat events");
+    int dispatch_rc = libinput_dispatch(li);
+    if (dispatch_rc != 0) {
+        fprintf(stderr, "FAIL: libinput_dispatch returned %d\n", dispatch_rc);
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
+    int event_count = 0;
+    for (;;) {
+        struct libinput_event *event = libinput_get_event(li);
+        if (event == NULL) {
+            break;
+        }
+        event_count++;
+        libinput_event_destroy(event);
+    }
+    if (event_count < 2) {
+        fprintf(stderr, "FAIL: libinput udev dispatch produced %d device events\n", event_count);
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
+    printf("libinput udev dispatch produced %d device events\n", event_count);
 
     libinput_unref(li);
     udev_unref(udev);
