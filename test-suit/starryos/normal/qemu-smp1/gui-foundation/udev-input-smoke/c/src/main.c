@@ -2,8 +2,11 @@
 #include <fcntl.h>
 #include <libinput.h>
 #include <libudev.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -13,6 +16,18 @@ struct SeenInput {
     bool event0;
     bool event1;
 };
+
+static void trace_step(const char *message) {
+    printf("udev-input-smoke: %s\n", message);
+    fflush(stdout);
+}
+
+static void fail_on_timeout(int signo) {
+    (void)signo;
+    const char message[] = "FAIL: udev input smoke timed out\n";
+    write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(124);
+}
 
 static int open_restricted(const char *path, int flags, void *user_data) {
     (void)user_data;
@@ -81,6 +96,21 @@ static int check_udev_input_device(struct udev_device *device, struct SeenInput 
                 id_input == NULL ? "(null)" : id_input);
         return 1;
     }
+    if (udev_device_has_tag(device, "seat") <= 0 || udev_device_has_tag(device, "seat0") <= 0) {
+        fprintf(stderr, "FAIL: udev input %s is missing seat tags\n", sysname);
+        return 1;
+    }
+    struct udev_device *parent = udev_device_get_parent(device);
+    const char *expected_parent = strcmp(sysname, "event0") == 0 ? "input0" : "input1";
+    const char *parent_sysname = parent == NULL ? NULL : udev_device_get_sysname(parent);
+    const char *parent_subsystem = parent == NULL ? NULL : udev_device_get_subsystem(parent);
+    if (parent_sysname == NULL || strcmp(parent_sysname, expected_parent) != 0 ||
+        parent_subsystem == NULL || strcmp(parent_subsystem, "input") != 0) {
+        fprintf(stderr, "FAIL: udev input %s parent sysname=%s subsystem=%s\n", sysname,
+                parent_sysname == NULL ? "(null)" : parent_sysname,
+                parent_subsystem == NULL ? "(null)" : parent_subsystem);
+        return 1;
+    }
 
     if (strcmp(sysname, "event0") == 0) {
         seen->event0 = true;
@@ -91,6 +121,7 @@ static int check_udev_input_device(struct udev_device *device, struct SeenInput 
 }
 
 static int check_udev_input_enumeration(void) {
+    trace_step("check udev input enumeration");
     struct udev *udev = udev_new();
     if (udev == NULL) {
         fprintf(stderr, "FAIL: udev_new returned NULL\n");
@@ -147,6 +178,7 @@ static int check_udev_input_enumeration(void) {
 }
 
 static int check_udev_devnum_lookup(void) {
+    trace_step("check udev devnum lookup");
     struct stat st;
     if (stat("/dev/input/event0", &st) != 0) {
         fprintf(stderr, "FAIL: stat /dev/input/event0: %s\n", strerror(errno));
@@ -184,16 +216,19 @@ static int check_udev_devnum_lookup(void) {
     return 0;
 }
 
-static int check_libinput_path_device(void) {
+static int check_libinput_path_device(const char *path,
+                                      enum libinput_device_capability capability,
+                                      const char *capability_name) {
+    trace_step(path);
     struct libinput *li = libinput_path_create_context(&libinput_iface, NULL);
     if (li == NULL) {
         fprintf(stderr, "FAIL: libinput_path_create_context returned NULL\n");
         return 1;
     }
 
-    struct libinput_device *device = libinput_path_add_device(li, "/dev/input/event0");
+    struct libinput_device *device = libinput_path_add_device(li, path);
     if (device == NULL) {
-        fprintf(stderr, "FAIL: libinput_path_add_device /dev/input/event0 returned NULL\n");
+        fprintf(stderr, "FAIL: libinput_path_add_device %s returned NULL\n", path);
         libinput_unref(li);
         return 1;
     }
@@ -204,24 +239,92 @@ static int check_libinput_path_device(void) {
         libinput_unref(li);
         return 1;
     }
+    if (libinput_device_has_capability(device, capability) == 0) {
+        fprintf(stderr, "FAIL: libinput path device %s name=%s lacks %s capability\n", path,
+                name, capability_name);
+        libinput_unref(li);
+        return 1;
+    }
+    printf("libinput path device %s name=%s has %s capability\n", path, name,
+           capability_name);
 
     libinput_path_remove_device(device);
     libinput_unref(li);
     return 0;
 }
 
+static int check_libinput_udev_seat(void) {
+    trace_step("create udev context for libinput seat");
+    struct udev *udev = udev_new();
+    if (udev == NULL) {
+        fprintf(stderr, "FAIL: udev_new returned NULL for libinput udev backend\n");
+        return 1;
+    }
+
+    trace_step("create libinput udev context");
+    struct libinput *li = libinput_udev_create_context(&libinput_iface, NULL, udev);
+    if (li == NULL) {
+        fprintf(stderr, "FAIL: libinput_udev_create_context returned NULL\n");
+        udev_unref(udev);
+        return 1;
+    }
+    trace_step("assign libinput udev seat0");
+    if (libinput_udev_assign_seat(li, "seat0") != 0) {
+        fprintf(stderr, "FAIL: libinput_udev_assign_seat seat0 failed\n");
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
+
+    trace_step("check libinput udev fd readiness");
+    struct pollfd pfd = {
+        .fd = libinput_get_fd(li),
+        .events = POLLIN,
+    };
+    int poll_rc = poll(&pfd, 1, 250);
+    if (poll_rc < 0) {
+        fprintf(stderr, "FAIL: poll libinput udev fd: %s\n", strerror(errno));
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        fprintf(stderr, "FAIL: libinput udev fd revents=0x%x\n", pfd.revents);
+        libinput_unref(li);
+        udev_unref(udev);
+        return 1;
+    }
+    printf("libinput udev seat assigned; fd=%d poll_rc=%d revents=0x%x\n", pfd.fd, poll_rc,
+           pfd.revents);
+
+    libinput_unref(li);
+    udev_unref(udev);
+    return 0;
+}
+
 int main(void) {
+    signal(SIGALRM, fail_on_timeout);
+    alarm(15);
+
     if (check_udev_input_enumeration() != 0) {
         return 1;
     }
     if (check_udev_devnum_lookup() != 0) {
         return 1;
     }
-    if (check_libinput_path_device() != 0) {
+    if (check_libinput_path_device("/dev/input/event0", LIBINPUT_DEVICE_CAP_POINTER,
+                                   "pointer") != 0) {
+        return 1;
+    }
+    if (check_libinput_path_device("/dev/input/event1", LIBINPUT_DEVICE_CAP_KEYBOARD,
+                                   "keyboard") != 0) {
+        return 1;
+    }
+    if (check_libinput_udev_seat() != 0) {
         return 1;
     }
 
-    printf("udev input enumeration and libinput path probe tests passed\n");
+    printf("udev input enumeration and libinput path/seat probe tests passed\n");
     printf("All udev input smoke tests passed!\n");
     return 0;
 }

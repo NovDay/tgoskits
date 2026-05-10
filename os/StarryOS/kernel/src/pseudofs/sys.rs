@@ -25,6 +25,7 @@ pub(crate) struct SysfsDevice {
     pub devname: String,
     pub major: u32,
     pub minor: u32,
+    pub parent_name: Option<String>,
 }
 
 pub(crate) fn framebuffer_device() -> Option<SysfsDevice> {
@@ -34,6 +35,7 @@ pub(crate) fn framebuffer_device() -> Option<SysfsDevice> {
         devname: "fb0".into(),
         major: FRAMEBUFFER_MAJOR,
         minor: FRAMEBUFFER_MINOR,
+        parent_name: None,
     })
 }
 
@@ -50,6 +52,7 @@ pub(crate) fn drm_card0_device() -> Option<SysfsDevice> {
             devname: "dri/card0".into(),
             major: DRM_MAJOR,
             minor: DRM_CARD0_MINOR,
+            parent_name: None,
         })
     }
 }
@@ -62,12 +65,17 @@ pub(crate) fn register_input_device(name: String, major: u32, minor: u32) {
         device.minor = minor;
         return;
     }
+    let parent_name = name
+        .strip_prefix("event")
+        .and_then(|idx| idx.parse::<usize>().ok())
+        .map(|idx| format!("input{idx}"));
     devices.push(SysfsDevice {
         devname: format!("input/{name}"),
         name,
         class: "input",
         major,
         minor,
+        parent_name,
     });
 }
 
@@ -145,12 +153,21 @@ fn write_udev_data(
     minor: u32,
     devname: &str,
     properties: &[&str],
+    tags: &[&str],
 ) -> LinuxResult<()> {
     ensure_path_dirs(fs, "/run/udev/data")?;
     let mut content = format!("I:1\nE:DEVNAME=/dev/{devname}\n");
     for property in properties {
         content.push_str("E:");
         content.push_str(property);
+        content.push('\n');
+    }
+    for tag in tags {
+        content.push_str("G:");
+        content.push_str(tag);
+        content.push('\n');
+        content.push_str("Q:");
+        content.push_str(tag);
         content.push('\n');
     }
     content.push_str("V:1\n");
@@ -215,7 +232,7 @@ fn populate_graphics(fs: &FsContext) -> LinuxResult<()> {
             major,
             minor,
         )?;
-        write_udev_data(fs, major, minor, &device.devname, &[])?;
+        write_udev_data(fs, major, minor, &device.devname, &[], &["seat"])?;
         ensure_symlink(
             fs,
             "../../../../class/graphics",
@@ -272,6 +289,7 @@ fn populate_drm(fs: &FsContext) -> LinuxResult<()> {
             minor,
             &device.devname,
             &["ID_PATH=platform-starry-drm"],
+            &["seat", "seat0", "master-of-seat"],
         )?;
         ensure_symlink(
             fs,
@@ -297,28 +315,27 @@ fn populate_input(fs: &FsContext) -> LinuxResult<()> {
         let major = device.major;
         let minor = device.minor;
         let class_dir = format!("/sys/class/input/{name}");
-        let device_dir = format!("/sys/devices/virtual/input/{name}");
-        ensure_path_dirs(fs, &class_dir)?;
+        let device_dir = input_sysfs_device_dir(&device);
+        let parent_dir = device
+            .parent_name
+            .as_ref()
+            .map(|parent| format!("/sys/devices/virtual/input/{parent}"));
         ensure_path_dirs(fs, &device_dir)?;
-        ensure_dev_char_link(
-            fs,
-            major,
-            minor,
-            &format!("../../devices/virtual/input/{name}"),
-        )?;
-        write_file(
-            fs,
-            &format!("{class_dir}/dev"),
-            &format!("{major}:{minor}\n"),
-        )?;
-        write_file(fs, &format!("{class_dir}/name"), &format!("{name}\n"))?;
-        write_uevent(
-            fs,
-            &format!("{class_dir}/uevent"),
-            &format!("input/{name}"),
-            major,
-            minor,
-        )?;
+        if let (Some(parent), Some(parent_dir)) = (&device.parent_name, &parent_dir) {
+            ensure_path_dirs(fs, parent_dir)?;
+            write_file(fs, &format!("{parent_dir}/name"), &format!("{parent}\n"))?;
+            write_file(
+                fs,
+                &format!("{parent_dir}/uevent"),
+                &format!("PRODUCT=0/0/0/0\nNAME={parent}\n"),
+            )?;
+            ensure_symlink(
+                fs,
+                "../../../../class/input",
+                &format!("{parent_dir}/subsystem"),
+            )?;
+        }
+        ensure_dev_char_link(fs, major, minor, &dev_char_device_target(&device))?;
         write_file(
             fs,
             &format!("{device_dir}/dev"),
@@ -338,20 +355,17 @@ fn populate_input(fs: &FsContext) -> LinuxResult<()> {
             minor,
             &device.devname,
             input_udev_properties(name),
+            &["seat", "seat0"],
+        )?;
+        ensure_symlink(fs, &class_input_entry_target(&device), &class_dir)?;
+        ensure_symlink(
+            fs,
+            &input_device_parent_target(&device),
+            &format!("{device_dir}/device"),
         )?;
         ensure_symlink(
             fs,
-            &format!("../../../devices/virtual/input/{name}"),
-            &format!("{class_dir}/device"),
-        )?;
-        ensure_symlink(
-            fs,
-            "../../../class/input",
-            &format!("{class_dir}/subsystem"),
-        )?;
-        ensure_symlink(
-            fs,
-            "../../../../class/input",
+            &input_device_subsystem_target(&device),
             &format!("{device_dir}/subsystem"),
         )?;
     }
@@ -359,11 +373,61 @@ fn populate_input(fs: &FsContext) -> LinuxResult<()> {
     Ok(())
 }
 
+pub(crate) fn input_sysfs_device_dir(device: &SysfsDevice) -> String {
+    if device.class == "input" {
+        if let Some(parent) = &device.parent_name {
+            return format!("/sys/devices/virtual/input/{parent}/{}", device.name);
+        }
+    }
+    format!("/sys/devices/virtual/{}/{}", device.class, device.name)
+}
+
+pub(crate) fn class_input_entry_target(device: &SysfsDevice) -> String {
+    if device.class == "input" {
+        if let Some(parent) = &device.parent_name {
+            return format!("../../devices/virtual/input/{parent}/{}", device.name);
+        }
+    }
+    format!("../../devices/virtual/{}/{}", device.class, device.name)
+}
+
+pub(crate) fn dev_char_device_target(device: &SysfsDevice) -> String {
+    if device.class == "input" {
+        if let Some(parent) = &device.parent_name {
+            return format!("../../devices/virtual/input/{parent}/{}", device.name);
+        }
+    }
+    format!("../../devices/virtual/{}/{}", device.class, device.name)
+}
+
+fn input_device_subsystem_target(device: &SysfsDevice) -> &'static str {
+    if device.class == "input" && device.parent_name.is_some() {
+        "../../../../../class/input"
+    } else {
+        "../../../../class/input"
+    }
+}
+
+fn input_device_parent_target(device: &SysfsDevice) -> &'static str {
+    if device.class == "input" && device.parent_name.is_some() {
+        ".."
+    } else {
+        "."
+    }
+}
+
 #[allow(dead_code)]
 pub fn populate_udev_data() -> LinuxResult<()> {
     let fs = FS_CONTEXT.lock();
     if let Some(device) = framebuffer_device() {
-        write_udev_data(&fs, device.major, device.minor, &device.devname, &[])?;
+        write_udev_data(
+            &fs,
+            device.major,
+            device.minor,
+            &device.devname,
+            &[],
+            &["seat"],
+        )?;
     }
     if let Some(device) = drm_card0_device() {
         write_udev_data(
@@ -372,6 +436,7 @@ pub fn populate_udev_data() -> LinuxResult<()> {
             device.minor,
             &device.devname,
             &["ID_PATH=platform-starry-drm"],
+            &["seat", "seat0", "master-of-seat"],
         )?;
     }
     for device in input_devices() {
@@ -381,6 +446,7 @@ pub fn populate_udev_data() -> LinuxResult<()> {
             device.minor,
             &device.devname,
             input_udev_properties(&device.name),
+            &["seat", "seat0"],
         )?;
     }
     Ok(())

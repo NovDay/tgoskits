@@ -173,3 +173,28 @@ pub fn sys_getpriority(which: u32, who: u32) -> AxResult<isize> {
         _ => Err(AxError::InvalidInput),
     }
 }
+
+pub fn sys_setpriority(which: u32, who: u32, prio: i32) -> AxResult<isize> {
+    debug!("sys_setpriority <= which: {which}, who: {who}, prio: {prio}");
+    let _prio = prio.clamp(-20, 19);
+
+    match which {
+        PRIO_PROCESS => {
+            if who != 0 {
+                let _proc = get_process_data(who)?;
+            }
+        }
+        PRIO_PGRP => {
+            if who != 0 {
+                let _pg = get_process_group(who)?;
+            }
+        }
+        PRIO_USER => {
+            if who != 0 {
+                return Err(AxError::NoSuchProcess);
+            }
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+    Ok(0)
+}

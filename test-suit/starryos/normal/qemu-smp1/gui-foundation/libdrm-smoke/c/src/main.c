@@ -33,6 +33,28 @@ static bool plane_supports_format(const drmModePlane *plane, uint32_t format) {
     return false;
 }
 
+static bool plane_has_primary_type_property(int fd, uint32_t plane_id) {
+    drmModeObjectPropertiesPtr properties =
+        drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+    if (properties == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    for (uint32_t i = 0; i < properties->count_props; i++) {
+        drmModePropertyPtr property = drmModeGetProperty(fd, properties->props[i]);
+        if (property == NULL) {
+            continue;
+        }
+        if (strcmp(property->name, "type") == 0 && properties->prop_values[i] == 1) {
+            found = true;
+        }
+        drmModeFreeProperty(property);
+    }
+    drmModeFreeObjectProperties(properties);
+    return found;
+}
+
 int main(void) {
     int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -64,6 +86,10 @@ int main(void) {
         fprintf(stderr, "FAIL: DRM_CAP_DUMB_BUFFER=%llu\n", (unsigned long long)dumb_cap);
         close(fd);
         return 1;
+    }
+    if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0) {
+        close(fd);
+        return fail_errno("drmSetClientCap(DRM_CLIENT_CAP_UNIVERSAL_PLANES)");
     }
 
     drmModeResPtr resources = drmModeGetResources(fd);
@@ -178,7 +204,8 @@ int main(void) {
     }
     if (plane->crtc_id != crtc->crtc_id || (plane->possible_crtcs & 0x1U) == 0 ||
         !plane_supports_format(plane, DRM_FORMAT_XRGB8888) ||
-        !plane_supports_format(plane, DRM_FORMAT_ARGB8888)) {
+        !plane_supports_format(plane, DRM_FORMAT_ARGB8888) ||
+        !plane_has_primary_type_property(fd, plane->plane_id)) {
         fprintf(stderr, "FAIL: plane state id=%u crtc=%u possible=%#x formats=%u\n",
                 plane->plane_id, plane->crtc_id, plane->possible_crtcs, plane->count_formats);
         drmModeFreePlane(plane);
@@ -191,18 +218,14 @@ int main(void) {
         return 1;
     }
 
-    drmModeObjectPropertiesPtr plane_props =
-        drmModeObjectGetProperties(fd, plane->plane_id, DRM_MODE_OBJECT_PLANE);
     drmModeObjectPropertiesPtr crtc_props =
         drmModeObjectGetProperties(fd, crtc->crtc_id, DRM_MODE_OBJECT_CRTC);
     drmModeObjectPropertiesPtr connector_props =
         drmModeObjectGetProperties(fd, connector->connector_id, DRM_MODE_OBJECT_CONNECTOR);
-    if (plane_props == NULL || crtc_props == NULL || connector_props == NULL ||
-        plane_props->count_props != 0 || crtc_props->count_props != 0 ||
+    if (crtc_props == NULL || connector_props == NULL || crtc_props->count_props != 0 ||
         connector_props->count_props != 0) {
         fprintf(stderr,
-                "FAIL: object properties plane=%p/%u crtc=%p/%u connector=%p/%u\n",
-                (void *)plane_props, plane_props != NULL ? plane_props->count_props : UINT32_MAX,
+                "FAIL: object properties crtc=%p/%u connector=%p/%u\n",
                 (void *)crtc_props, crtc_props != NULL ? crtc_props->count_props : UINT32_MAX,
                 (void *)connector_props,
                 connector_props != NULL ? connector_props->count_props : UINT32_MAX);
@@ -211,9 +234,6 @@ int main(void) {
         }
         if (crtc_props != NULL) {
             drmModeFreeObjectProperties(crtc_props);
-        }
-        if (plane_props != NULL) {
-            drmModeFreeObjectProperties(plane_props);
         }
         drmModeFreePlane(plane);
         drmModeFreePlaneResources(plane_resources);
@@ -224,12 +244,11 @@ int main(void) {
         close(fd);
         return 1;
     }
-    printf("KMS plane %u supports XRGB8888/ARGB8888 and exposes no properties yet\n",
+    printf("KMS plane %u supports XRGB8888/ARGB8888 and exposes type=Primary\n",
            plane->plane_id);
 
     drmModeFreeObjectProperties(connector_props);
     drmModeFreeObjectProperties(crtc_props);
-    drmModeFreeObjectProperties(plane_props);
     drmModeFreePlane(plane);
     drmModeFreePlaneResources(plane_resources);
     drmModeFreeCrtc(crtc);

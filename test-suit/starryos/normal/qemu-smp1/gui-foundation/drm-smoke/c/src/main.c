@@ -13,6 +13,7 @@
 
 #define DRM_IOCTL_VERSION 0xc0406400
 #define DRM_IOCTL_GET_CAP 0xc010640c
+#define DRM_IOCTL_SET_CLIENT_CAP 0x4010640d
 #define DRM_IOCTL_SET_MASTER 0x641e
 #define DRM_IOCTL_DROP_MASTER 0x641f
 #define DRM_IOCTL_MODE_GETRESOURCES 0xc04064a0
@@ -33,6 +34,9 @@
 
 #define DRM_CAP_DUMB_BUFFER 0x1
 #define DRM_CAP_TIMESTAMP_MONOTONIC 0x6
+#define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
+#define DRM_MODE_PROP_IMMUTABLE (1U << 2)
+#define DRM_MODE_PROP_ENUM (1U << 3)
 #define DRM_MODE_TYPE_PREFERRED (1U << 3)
 #define DRM_MODE_TYPE_DRIVER (1U << 6)
 #define DRM_MODE_CONNECTOR_VIRTUAL 15
@@ -45,6 +49,7 @@
 #define DRM_MODE_OBJECT_PLANE 0xeeeeeeeeU
 #define DRM_MODE_PAGE_FLIP_EVENT 0x1
 #define DRM_EVENT_FLIP_COMPLETE 0x02
+#define DRM_PLANE_TYPE_PRIMARY 1
 #define DRM_FORMAT_XRGB8888 0x34325258U
 #define DRM_FORMAT_ARGB8888 0x34325241U
 
@@ -79,6 +84,11 @@ struct drm_version {
 };
 
 struct drm_get_cap {
+    uint64_t capability;
+    uint64_t value;
+};
+
+struct drm_set_client_cap {
     uint64_t capability;
     uint64_t value;
 };
@@ -163,6 +173,11 @@ struct drm_mode_get_property {
     char name[32];
     uint32_t count_values;
     uint32_t count_enum_blobs;
+};
+
+struct drm_mode_property_enum {
+    uint64_t value;
+    char name[32];
 };
 
 struct drm_mode_get_plane_res {
@@ -373,6 +388,19 @@ static int expect_cap(int fd, uint64_t capability, uint64_t expected) {
     return 0;
 }
 
+static int expect_client_cap(int fd, uint64_t capability, uint64_t value) {
+    struct drm_set_client_cap cap = {
+        .capability = capability,
+        .value = value,
+    };
+    if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) != 0) {
+        fprintf(stderr, "FAIL: DRM_IOCTL_SET_CLIENT_CAP %#llx=%#llx: %s\n",
+                (unsigned long long)capability, (unsigned long long)value, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 static int expect_getresources(int fd, struct drm_resource_ids *ids) {
     struct drm_mode_card_res res = {0};
     if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) != 0) {
@@ -540,6 +568,75 @@ static int expect_object_has_no_properties(int fd, uint32_t obj_id, uint32_t obj
     return 0;
 }
 
+static int expect_plane_type_property(int fd, uint32_t plane_id) {
+    uint32_t prop_id = UINT32_MAX;
+    uint64_t prop_value = UINT64_MAX;
+    struct drm_mode_obj_get_properties props = {
+        .props_ptr = (uintptr_t)&prop_id,
+        .prop_values_ptr = (uintptr_t)&prop_value,
+        .count_props = 1,
+        .obj_id = plane_id,
+        .obj_type = DRM_MODE_OBJECT_PLANE,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &props) != 0) {
+        fprintf(stderr, "FAIL: MODE_OBJ_GETPROPERTIES plane=%u: %s\n", plane_id,
+                strerror(errno));
+        return 1;
+    }
+    if (props.count_props != 1 || prop_id == UINT32_MAX ||
+        prop_value != DRM_PLANE_TYPE_PRIMARY) {
+        fprintf(stderr, "FAIL: plane props count=%u prop=%u value=%#llx\n",
+                props.count_props, prop_id, (unsigned long long)prop_value);
+        return 1;
+    }
+
+    struct drm_mode_get_property property = {
+        .prop_id = prop_id,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPROPERTY plane type count probe: %s\n",
+                strerror(errno));
+        return 1;
+    }
+    if (strcmp(property.name, "type") != 0 ||
+        property.flags != (DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE) ||
+        property.count_values != 3 || property.count_enum_blobs != 3) {
+        fprintf(stderr,
+                "FAIL: plane type property name=%s flags=%#x values=%u enums=%u\n",
+                property.name, property.flags, property.count_values,
+                property.count_enum_blobs);
+        return 1;
+    }
+
+    uint64_t values[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    struct drm_mode_property_enum enums[3] = {0};
+    property.values_ptr = (uintptr_t)values;
+    property.enum_blob_ptr = (uintptr_t)enums;
+    property.count_values = 3;
+    property.count_enum_blobs = 3;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0) {
+        fprintf(stderr, "FAIL: MODE_GETPROPERTY plane type values probe: %s\n",
+                strerror(errno));
+        return 1;
+    }
+    if (values[0] != 0 || values[1] != DRM_PLANE_TYPE_PRIMARY || values[2] != 2 ||
+        enums[0].value != 0 ||
+        strcmp(enums[0].name, "Overlay") != 0 ||
+        enums[1].value != DRM_PLANE_TYPE_PRIMARY ||
+        strcmp(enums[1].name, "Primary") != 0 || enums[2].value != 2 ||
+        strcmp(enums[2].name, "Cursor") != 0) {
+        fprintf(stderr,
+                "FAIL: plane type values=%llu/%llu/%llu enums=%llu:%s,%llu:%s,%llu:%s\n",
+                (unsigned long long)values[0], (unsigned long long)values[1],
+                (unsigned long long)values[2],
+                (unsigned long long)enums[0].value, enums[0].name,
+                (unsigned long long)enums[1].value, enums[1].name,
+                (unsigned long long)enums[2].value, enums[2].name);
+        return 1;
+    }
+    return 0;
+}
+
 static int expect_plane_and_properties(int fd, struct drm_resource_ids *ids) {
     struct drm_mode_get_plane_res plane_res = {0};
     if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_res) != 0) {
@@ -609,7 +706,7 @@ static int expect_plane_and_properties(int fd, struct drm_resource_ids *ids) {
     if (expect_object_has_no_properties(fd, ids->crtc_id, DRM_MODE_OBJECT_CRTC) != 0 ||
         expect_object_has_no_properties(fd, ids->connector_id, DRM_MODE_OBJECT_CONNECTOR) != 0 ||
         expect_object_has_no_properties(fd, ids->encoder_id, DRM_MODE_OBJECT_ENCODER) != 0 ||
-        expect_object_has_no_properties(fd, ids->plane_id, DRM_MODE_OBJECT_PLANE) != 0) {
+        expect_plane_type_property(fd, ids->plane_id) != 0) {
         return 1;
     }
 
@@ -622,7 +719,7 @@ static int expect_plane_and_properties(int fd, struct drm_resource_ids *ids) {
         return 1;
     }
 
-    printf("KMS plane resources and empty object property probes passed\n");
+    printf("KMS plane resources and primary type property probes passed\n");
     return 0;
 }
 
@@ -851,7 +948,9 @@ int main(void) {
 
     struct drm_resource_ids ids = {0};
     if (expect_version(fd) != 0 || expect_cap(fd, DRM_CAP_DUMB_BUFFER, 1) != 0 ||
-        expect_cap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, 1) != 0 || ioctl(fd, DRM_IOCTL_SET_MASTER) != 0 ||
+        expect_cap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, 1) != 0 ||
+        expect_client_cap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0 ||
+        ioctl(fd, DRM_IOCTL_SET_MASTER) != 0 ||
         ioctl(fd, DRM_IOCTL_DROP_MASTER) != 0 || expect_getresources(fd, &ids) != 0 ||
         expect_kms_topology(fd, &ids) != 0 || expect_plane_and_properties(fd, &ids) != 0 ||
         expect_kms_dumb_scanout(fd, &ids) != 0) {

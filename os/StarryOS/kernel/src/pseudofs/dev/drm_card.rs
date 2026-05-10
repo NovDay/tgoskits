@@ -16,6 +16,7 @@ pub const CARD0_DEVICE_ID: DeviceId = DeviceId::new(226, 0);
 
 const DRM_IOCTL_VERSION: u32 = 0xc040_6400;
 const DRM_IOCTL_GET_CAP: u32 = 0xc010_640c;
+const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640d;
 const DRM_IOCTL_SET_MASTER: u32 = 0x641e;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x641f;
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xc040_64a0;
@@ -35,6 +36,7 @@ const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = 0xc004_64b4;
 
 const DRM_CAP_DUMB_BUFFER: u64 = 0x1;
 const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 
 const DRIVER_NAME: &[u8] = b"starrydrm";
 const DRIVER_DATE: &[u8] = b"20260509";
@@ -44,9 +46,12 @@ const CRTC_ID: u32 = 32;
 const CONNECTOR_ID: u32 = 64;
 const ENCODER_ID: u32 = 96;
 const PLANE_ID: u32 = 112;
+const PLANE_TYPE_PROPERTY_ID: u32 = 128;
 
 const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
 const DRM_MODE_TYPE_DRIVER: u32 = 1 << 6;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
+const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_MODE_SUBPIXEL_UNKNOWN: u32 = 1;
@@ -58,6 +63,7 @@ const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 const DRM_MODE_OBJECT_ANY: u32 = 0;
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x1;
 const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
 const DRM_FORMAT_XRGB8888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
 const DRM_FORMAT_ARGB8888: u32 = fourcc_code(b'A', b'R', b'2', b'4');
 const PLANE_FORMATS: &[u32] = &[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
@@ -86,6 +92,13 @@ struct DrmVersion {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DrmGetCap {
+    capability: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmSetClientCap {
     capability: u64,
     value: u64,
 }
@@ -182,6 +195,13 @@ struct DrmModeGetProperty {
     name: [u8; 32],
     count_values: u32,
     count_enum_blobs: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmModePropertyEnum {
+    value: u64,
+    name: [u8; 32],
 }
 
 #[repr(C)]
@@ -359,6 +379,7 @@ impl DeviceOps for DrmCard {
         match cmd {
             DRM_IOCTL_VERSION => drm_version(arg),
             DRM_IOCTL_GET_CAP => drm_get_cap(arg),
+            DRM_IOCTL_SET_CLIENT_CAP => drm_set_client_cap(arg),
             DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => Ok(0),
             DRM_IOCTL_MODE_GETRESOURCES => drm_mode_getresources(arg),
             DRM_IOCTL_MODE_GETCRTC => drm_mode_getcrtc(arg),
@@ -458,6 +479,21 @@ fn drm_get_cap(arg: usize) -> VfsResult<usize> {
     };
     (arg as *mut DrmGetCap).vm_write(cap)?;
     Ok(0)
+}
+
+fn drm_set_client_cap(arg: usize) -> VfsResult<usize> {
+    if arg == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let cap = unsafe {
+        (arg as *const DrmSetClientCap)
+            .vm_read_uninit()?
+            .assume_init()
+    };
+    match (cap.capability, cap.value) {
+        (DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0 | 1) => Ok(0),
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 fn drm_mode_getresources(arg: usize) -> VfsResult<usize> {
@@ -667,15 +703,38 @@ fn drm_mode_getproperty(arg: usize) -> VfsResult<usize> {
     if arg == 0 {
         return Err(AxError::BadAddress);
     }
-    let property = unsafe {
+    let mut property = unsafe {
         (arg as *const DrmModeGetProperty)
             .vm_read_uninit()?
             .assume_init()
     };
-    if property.prop_id == 0 {
+    if property.prop_id != PLANE_TYPE_PROPERTY_ID {
         return Err(AxError::InvalidInput);
     }
-    Err(AxError::InvalidInput)
+    if property.values_ptr != 0 && property.count_values != 0 {
+        vm_write_drm_values(
+            property.values_ptr,
+            &[0, DRM_PLANE_TYPE_PRIMARY, 2],
+            property.count_values,
+        )?;
+    }
+    if property.enum_blob_ptr != 0 && property.count_enum_blobs != 0 {
+        vm_write_drm_property_enums(
+            property.enum_blob_ptr,
+            &[
+                DrmModePropertyEnum::new(0, b"Overlay"),
+                DrmModePropertyEnum::new(DRM_PLANE_TYPE_PRIMARY, b"Primary"),
+                DrmModePropertyEnum::new(2, b"Cursor"),
+            ],
+            property.count_enum_blobs,
+        )?;
+    }
+    property.flags = DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE;
+    property.name = nul_padded_name(b"type");
+    property.count_values = 3;
+    property.count_enum_blobs = 3;
+    (arg as *mut DrmModeGetProperty).vm_write(property)?;
+    Ok(0)
 }
 
 fn drm_mode_getplaneresources(arg: usize) -> VfsResult<usize> {
@@ -737,7 +796,25 @@ fn drm_mode_obj_getproperties(arg: usize) -> VfsResult<usize> {
     if !is_known_drm_object(properties.obj_id, properties.obj_type) {
         return Err(AxError::InvalidInput);
     }
-    properties.count_props = 0;
+    if properties.obj_type == DRM_MODE_OBJECT_PLANE {
+        if properties.props_ptr != 0 && properties.count_props != 0 {
+            vm_write_drm_ids(
+                properties.props_ptr,
+                &[PLANE_TYPE_PROPERTY_ID],
+                properties.count_props,
+            )?;
+        }
+        if properties.prop_values_ptr != 0 && properties.count_props != 0 {
+            vm_write_drm_values(
+                properties.prop_values_ptr,
+                &[DRM_PLANE_TYPE_PRIMARY],
+                properties.count_props,
+            )?;
+        }
+        properties.count_props = 1;
+    } else {
+        properties.count_props = 0;
+    }
     (arg as *mut DrmModeObjGetProperties).vm_write(properties)?;
     Ok(0)
 }
@@ -945,6 +1022,25 @@ fn is_known_drm_object(id: u32, object_type: u32) -> bool {
     }
 }
 
+impl DrmModePropertyEnum {
+    const fn new(value: u64, name: &[u8]) -> Self {
+        Self {
+            value,
+            name: nul_padded_name(name),
+        }
+    }
+}
+
+const fn nul_padded_name(name: &[u8]) -> [u8; 32] {
+    let mut out = [0; 32];
+    let mut idx = 0;
+    while idx < name.len() && idx < out.len() {
+        out[idx] = name[idx];
+        idx += 1;
+    }
+    out
+}
+
 fn drm_mmap(offset: u64) -> DeviceMmap {
     let Some(handle) = map_handle_from_offset(offset) else {
         return DeviceMmap::None;
@@ -1006,6 +1102,23 @@ fn blit_framebuffer_to_display(fb: &DrmFramebuffer, buffer: &DumbBuffer) -> VfsR
 fn vm_write_drm_ids(dst: u64, ids: &[u32], user_count: u32) -> VfsResult<()> {
     let copy_count = (user_count as usize).min(ids.len());
     Ok(vm_write_slice(dst as *mut u32, &ids[..copy_count])?)
+}
+
+fn vm_write_drm_values(dst: u64, values: &[u64], user_count: u32) -> VfsResult<()> {
+    let copy_count = (user_count as usize).min(values.len());
+    Ok(vm_write_slice(dst as *mut u64, &values[..copy_count])?)
+}
+
+fn vm_write_drm_property_enums(
+    dst: u64,
+    values: &[DrmModePropertyEnum],
+    user_count: u32,
+) -> VfsResult<()> {
+    let copy_count = (user_count as usize).min(values.len());
+    Ok(vm_write_slice(
+        dst as *mut DrmModePropertyEnum,
+        &values[..copy_count],
+    )?)
 }
 
 fn vm_write_drm_modes(dst: u64, modes: &[DrmModeModeInfo], user_count: u32) -> VfsResult<()> {

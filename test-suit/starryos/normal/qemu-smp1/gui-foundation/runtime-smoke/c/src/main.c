@@ -1,4 +1,7 @@
 #include <errno.h>
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,6 +182,36 @@ static int test_runtime_dirs(void) {
     return 0;
 }
 
+static int test_gui_runtime_syscalls(void) {
+    if (prctl(PR_CAPBSET_READ, CAP_SYS_NICE, 0, 0, 0) != 1) {
+        fprintf(stderr, "FAIL: prctl(PR_CAPBSET_READ, CAP_SYS_NICE): %s\n",
+                strerror(errno));
+        return 1;
+    }
+    errno = 0;
+    if (prctl(PR_CAPBSET_READ, 1024, 0, 0, 0) != -1 || errno != EINVAL) {
+        fprintf(stderr, "FAIL: prctl(PR_CAPBSET_READ invalid cap) errno=%d\n", errno);
+        return 1;
+    }
+
+    errno = 0;
+    if (getpriority(PRIO_PROCESS, 0) != 0 || errno != 0) {
+        fprintf(stderr, "FAIL: getpriority(PRIO_PROCESS): value/errno mismatch errno=%d\n",
+                errno);
+        return 1;
+    }
+    if (setpriority(PRIO_PROCESS, 0, 1) != 0) {
+        fprintf(stderr, "FAIL: setpriority(PRIO_PROCESS): %s\n", strerror(errno));
+        return 1;
+    }
+    if (setpriority(PRIO_PROCESS, 0, 20) != 0) {
+        fprintf(stderr, "FAIL: setpriority clamped high prio: %s\n", strerror(errno));
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(void) {
     if (test_proc_status() != 0) {
         return 1;
@@ -187,6 +220,9 @@ int main(void) {
         return 1;
     }
     if (test_runtime_dirs() != 0) {
+        return 1;
+    }
+    if (test_gui_runtime_syscalls() != 0) {
         return 1;
     }
 
